@@ -1,0 +1,39 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// Fused REPEAT + MUL + ADD:  dst = r + repeat(a) * repeat(w)
+// a and w broadcast onto dst's shape, r matches dst exactly. All f32,
+// all contiguous. Used for the hyper-connection combine scatter.
+
+layout (push_constant) uniform parameter
+{
+    uint ne;
+    uint ne0;   uint ne1;   uint ne2;   uint ne3;
+    uint a_ne0; uint a_ne1; uint a_ne2; uint a_ne3;
+    uint w_ne0; uint w_ne1; uint w_ne2; uint w_ne3;
+} p;
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer A {float data_a[];};
+layout (binding = 1) readonly  buffer W {float data_w[];};
+layout (binding = 2) readonly  buffer R {float data_r[];};
+layout (binding = 3) writeonly buffer D {float data_d[];};
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+
+    const uint i0 =  idx % p.ne0;
+    const uint i1 = (idx / p.ne0) % p.ne1;
+    const uint i2 = (idx / (p.ne0 * p.ne1)) % p.ne2;
+    const uint i3 =  idx / (p.ne0 * p.ne1 * p.ne2);
+
+    const uint ia = (i0 % p.a_ne0) + p.a_ne0 * ((i1 % p.a_ne1) + p.a_ne1 * ((i2 % p.a_ne2) + p.a_ne2 * (i3 % p.a_ne3)));
+    const uint iw = (i0 % p.w_ne0) + p.w_ne0 * ((i1 % p.w_ne1) + p.w_ne1 * ((i2 % p.w_ne2) + p.w_ne2 * (i3 % p.w_ne3)));
+
+    data_d[idx] = data_r[idx] + data_a[ia] * data_w[iw];
+}

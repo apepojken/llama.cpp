@@ -653,6 +653,10 @@ static constexpr std::initializer_list<ggml_op> topk_moe_late_softmax      { GGM
 
 // Snake activation: y = x + sin(a*x)^2 * inv_b. Used by the optimize_graph reorder
 // pass so it keeps the chain contiguous and by the dispatcher to detect the fusion.
+static constexpr std::initializer_list<ggml_op> mul_bcast_add_pattern      { GGML_OP_REPEAT, GGML_OP_RESHAPE,
+                                                                              GGML_OP_MUL, GGML_OP_ADD };
+static constexpr std::initializer_list<ggml_op> mul_bcast_add_pattern_novw  { GGML_OP_REPEAT, GGML_OP_MUL,
+                                                                              GGML_OP_ADD };
 static constexpr std::initializer_list<ggml_op> snake_pattern              { GGML_OP_MUL,      GGML_OP_SIN,
                                                                              GGML_OP_SQR,      GGML_OP_MUL,
                                                                              GGML_OP_ADD };
@@ -1119,6 +1123,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_col2im_1d_f16;
     vk_pipeline pipeline_col2im_1d_bf16;
     vk_pipeline pipeline_out_prod_f32;
+    vk_pipeline pipeline_mul_bcast_add_f32;
     vk_pipeline pipeline_snake_f32;
     vk_pipeline pipeline_snake_f16;
     vk_pipeline pipeline_snake_bf16;
@@ -1891,6 +1896,13 @@ struct vk_op_conv_transpose_1d_push_constants {
 struct vk_op_snake_push_constants {
     uint32_t ne0;
     uint32_t ne1;
+};
+
+struct vk_op_mul_bcast_add_push_constants {
+    uint32_t ne;
+    uint32_t ne0,   ne1,   ne2,   ne3;
+    uint32_t a_ne0, a_ne1, a_ne2, a_ne3;
+    uint32_t w_ne0, w_ne1, w_ne2, w_ne3;
 };
 
 struct vk_op_pool1d_push_constants {
@@ -5991,6 +6003,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_out_prod_f32, "out_prod_f32", out_prod_f32_len, out_prod_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1);
 
+    ggml_vk_create_pipeline(device, device->pipeline_mul_bcast_add_f32, "mul_bcast_add_f32", mul_bcast_add_f32_len, mul_bcast_add_f32_data, "main", 4, sizeof(vk_op_mul_bcast_add_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_f32,  "snake_f32",  snake_f32_len,  snake_f32_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_f16,  "snake_f16",  snake_f16_len,  snake_f16_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_bf16, "snake_bf16", snake_bf16_len, snake_bf16_data, "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
@@ -14693,6 +14706,52 @@ static void ggml_vk_col2im_1d(ggml_backend_vk_context * ctx, vk_context& subctx,
 // Match the naive mul -> sin -> sqr -> mul -> add chain and run the
 // dedicated kernel directly. The pattern is validated by
 // ggml_vk_can_fuse_snake before this call.
+static void ggml_vk_mul_bcast_add_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * rep = cgraph->nodes[node_idx];
+    // locate the MUL and ADD within the fused span (views may be interleaved)
+    const ggml_tensor * mul = nullptr;
+    ggml_tensor *       add = nullptr;
+    for (int i = node_idx + 1; i <= node_idx + ctx->num_additional_fused_ops; ++i) {
+        ggml_tensor * n = cgraph->nodes[i];
+        if (n->op == GGML_OP_MUL) {
+            mul = n;
+        } else if (n->op == GGML_OP_ADD) {
+            add = n;
+        }
+    }
+    GGML_ASSERT(mul != nullptr && add != nullptr);
+
+    const ggml_tensor * a = rep->src[0];
+    const ggml_tensor * w = mul->src[0] == rep ? mul->src[1] : mul->src[0];
+    const ggml_tensor * r = add->src[0] == mul ? add->src[1] : add->src[0];
+
+    vk_pipeline pipeline = ctx->device->pipeline_mul_bcast_add_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer a_buf = ggml_vk_tensor_subbuffer(ctx, a);
+    vk_subbuffer w_buf = ggml_vk_tensor_subbuffer(ctx, w);
+    vk_subbuffer r_buf = ggml_vk_tensor_subbuffer(ctx, r);
+    vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, add);
+
+    vk_op_mul_bcast_add_push_constants pc{};
+    pc.ne    = (uint32_t) ggml_nelements(add);
+    pc.ne0   = (uint32_t) add->ne[0];
+    pc.ne1   = (uint32_t) add->ne[1];
+    pc.ne2   = (uint32_t) add->ne[2];
+    pc.ne3   = (uint32_t) add->ne[3];
+    pc.a_ne0 = (uint32_t) a->ne[0];
+    pc.a_ne1 = (uint32_t) a->ne[1];
+    pc.a_ne2 = (uint32_t) a->ne[2];
+    pc.a_ne3 = (uint32_t) a->ne[3];
+    pc.w_ne0 = (uint32_t) w->ne[0];
+    pc.w_ne1 = (uint32_t) w->ne[1];
+    pc.w_ne2 = (uint32_t) w->ne[2];
+    pc.w_ne3 = (uint32_t) w->ne[3];
+
+    std::array<uint32_t, 3> elements = { pc.ne, 1, 1 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a_buf, w_buf, r_buf, d_buf }, pc, elements);
+}
+
 static void ggml_vk_snake_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * mul0 = cgraph->nodes[node_idx + 0];
     const ggml_tensor * sqr  = cgraph->nodes[node_idx + 2];
@@ -15981,7 +16040,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
     switch (node->op) {
     case GGML_OP_REPEAT:
-        ggml_vk_repeat(ctx, compute_ctx, src0, node);
+        if (ctx->num_additional_fused_ops) {
+            ggml_vk_mul_bcast_add_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_repeat(ctx, compute_ctx, src0, node);
+        }
 
         break;
     case GGML_OP_REPEAT_BACK:
@@ -17693,6 +17756,95 @@ static bool ggml_vk_can_fuse_rms_norm_set_rows(ggml_backend_vk_context * ctx, co
 // Pattern check for the 5-op Snake fusion: mul -> sin -> sqr -> mul -> add.
 // Verifies the chain shape, the closure x_in_add == x_in_mul0, and that
 // the broadcast operands a and inv_b share a [1, C] layout.
+// Match REPEAT + MUL + ADD (empty view ops may be interleaved):
+//   dst = r + repeat(a) * w
+// the hyper-connection combine scatter. On success *num_fused is the span
+// length after the anchor (including any interleaved view nodes).
+static bool ggml_vk_can_fuse_mul_bcast_add(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
+                                           int node_idx, int * num_fused) {
+    GGML_UNUSED(ctx);
+    const ggml_tensor * rep = cgraph->nodes[node_idx];
+    if (rep->op != GGML_OP_REPEAT || rep->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // find the MUL and the ADD, allowing empty (view) nodes in between
+    const int last = std::min(node_idx + 6, cgraph->n_nodes - 1);
+    int mul_idx = -1;
+    int add_idx = -1;
+    for (int i = node_idx + 1; i <= last; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (ggml_op_is_empty(n->op)) {
+            continue;
+        }
+        if (mul_idx < 0) {
+            if (n->op != GGML_OP_MUL) {
+                return false;
+            }
+            mul_idx = i;
+        } else {
+            if (n->op != GGML_OP_ADD) {
+                return false;
+            }
+            add_idx = i;
+            break;
+        }
+    }
+    if (add_idx < 0) {
+        return false;
+    }
+
+    const ggml_tensor * mul = cgraph->nodes[mul_idx];
+    const ggml_tensor * add = cgraph->nodes[add_idx];
+    if (mul->src[0] != rep && mul->src[1] != rep) {
+        return false;
+    }
+    if (add->src[0] != mul && add->src[1] != mul) {
+        return false;
+    }
+    const ggml_tensor * a = rep->src[0];
+    const ggml_tensor * w = mul->src[0] == rep ? mul->src[1] : mul->src[0];
+    const ggml_tensor * r = add->src[0] == mul ? add->src[1] : add->src[0];
+
+    // intermediates must have a single use and not be graph outputs
+    if (!ggml_node_has_n_uses(cgraph, node_idx, 1) ||
+        !ggml_node_has_n_uses(cgraph, mul_idx, 1)) {
+        return false;
+    }
+    if ((rep->flags & GGML_TENSOR_FLAG_OUTPUT) || (mul->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    // all f32
+    if (mul->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 ||
+        a->type   != GGML_TYPE_F32 || w->type   != GGML_TYPE_F32 || r->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // mul and add preserve the repeat's (dst) shape; r matches the output exactly
+    if (!ggml_are_same_shape(mul, rep) || !ggml_are_same_shape(add, rep) || !ggml_are_same_shape(r, add)) {
+        return false;
+    }
+    // the shader indexes by dimension sizes, so everything must be contiguous
+    if (!ggml_is_contiguous(rep) || !ggml_is_contiguous(mul) || !ggml_is_contiguous(add) ||
+        !ggml_is_contiguous(a)   || !ggml_is_contiguous(w)   || !ggml_is_contiguous(r)) {
+        return false;
+    }
+    // both broadcast operands must repeat onto the output shape
+    if (!ggml_can_repeat(a, add) || !ggml_can_repeat(w, add)) {
+        return false;
+    }
+    // anything interleaved in the span must be an empty view op
+    for (int i = node_idx + 1; i < add_idx; ++i) {
+        if (i == mul_idx) {
+            continue;
+        }
+        if (!ggml_op_is_empty(cgraph->nodes[i]->op)) {
+            return false;
+        }
+    }
+
+    *num_fused = add_idx - node_idx;
+    return true;
+}
+
 static bool ggml_vk_can_fuse_snake(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     GGML_UNUSED(ctx);
     if (!ggml_can_fuse(cgraph, node_idx, snake_pattern)) {
@@ -18154,6 +18306,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = false;
                 op_srcs_fused_elementwise[2] = false;
+            } else if (int mba_span = 0; ggml_vk_can_fuse_mul_bcast_add(ctx, cgraph, i, &mba_span)) {
+                ctx->num_additional_fused_ops = mba_span;
+                fusion_string = "REPEAT_MUL_ADD";
+                // elementwise=true: the shader reads data_r[idx] into a register before
+                // writing data_d[idx], so the common in-place case (residual buffer reused
+                // for the output) is safe under exact aliasing. The broadcast operands can
+                // never exactly alias the (larger) output, so partial overlaps still
+                // disable fusion via the overlap check.
+                std::fill_n(op_srcs_fused_elementwise, mba_span + 1, true);
             } else if (ggml_vk_can_fuse_snake(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 4;
                 fusion_string = "SNAKE";
@@ -18500,6 +18661,12 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         if (keep_pattern(rope_view_set_rows_pattern)) {
             continue;
         }
+        if (keep_pattern(mul_bcast_add_pattern)) {
+            continue;
+        }
+        if (keep_pattern(mul_bcast_add_pattern_novw)) {
+            continue;
+        }
 
         // First, grab the next unused node.
         current_set.push_back(first_unused);
@@ -18566,7 +18733,9 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 match_pattern(rms_norm_mul_add_pattern, j) ||
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
-                match_pattern(rope_view_set_rows_pattern, j)) {
+                match_pattern(rope_view_set_rows_pattern, j) ||
+                match_pattern(mul_bcast_add_pattern, j) ||
+                match_pattern(mul_bcast_add_pattern_novw, j)) {
                 continue;
             }
             bool ok = true;
