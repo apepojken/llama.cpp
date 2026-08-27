@@ -25,6 +25,8 @@ layout (push_constant) uniform parameter
     uint batch_stride_d;
 
     uint fusion_flags;
+    float fuse_scale0;
+    float fuse_scale1;
 
 #ifdef MUL_MAT_ID
     uint nei0;
@@ -86,6 +88,28 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #endif
 }
 
+// Fused elementwise epilog for MUL_MAT + SCALE/SILU/SIGMOID/MUL chains.
+// Applied in fixed order: scale0 -> unary -> scale1 -> mul (see ggml_vk_can_fuse_mmv_epilog).
+FLOAT_TYPE apply_fused_epilog(FLOAT_TYPE v, const uint idx) {
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALEC0) != 0) {
+        v *= FLOAT_TYPE(p.fuse_scale0);
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SILU) != 0) {
+        const float x = float(v);
+        v = FLOAT_TYPE(x / (1.0f + exp(-x)));
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SIGMOID) != 0) {
+        v = FLOAT_TYPE(1.0f / (1.0f + exp(-float(v))));
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALEC1) != 0) {
+        v *= FLOAT_TYPE(p.fuse_scale1);
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_MUL0) != 0) {
+        v *= FLOAT_TYPE(data_fuse0[idx]);
+    }
+    return v;
+}
+
 layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
@@ -120,6 +144,7 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
+                temp[j][n] = apply_fused_epilog(temp[j][n], j*p.batch_stride_d + d_offset + first_row + n);
 #endif
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
             }
@@ -175,6 +200,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
+                temp[j][n] = apply_fused_epilog(temp[j][n], j*p.batch_stride_d + d_offset + first_row + n);
 #endif
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
             }
@@ -220,6 +246,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
+                tmpsh[j][n][0] = apply_fused_epilog(tmpsh[j][n][0], j*p.batch_stride_d + d_offset + first_row + n);
 #endif
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
             }

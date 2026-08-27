@@ -1343,6 +1343,11 @@ struct vk_mat_mat_push_constants {
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+#define MAT_VEC_FUSION_FLAGS_SCALEC0 0x10
+#define MAT_VEC_FUSION_FLAGS_SILU 0x20
+#define MAT_VEC_FUSION_FLAGS_SIGMOID 0x40
+#define MAT_VEC_FUSION_FLAGS_SCALEC1 0x80
+#define MAT_VEC_FUSION_FLAGS_MUL0 0x100
 
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
@@ -1353,6 +1358,8 @@ struct vk_mat_vec_push_constants {
     uint32_t batch_stride_b;
     uint32_t batch_stride_d;
     uint32_t fusion_flags;
+    float    fuse_scale0;
+    float    fuse_scale1;
     uint32_t base_work_group_y;
     uint32_t ne02;
     uint32_t ne12;
@@ -1403,6 +1410,8 @@ struct vk_mat_vec_id_push_constants {
     uint32_t batch_stride_b;
     uint32_t batch_stride_d;
     uint32_t fusion_flags;
+    float    fuse_scale0;
+    float    fuse_scale1;
     uint32_t nei0;
     uint32_t ne11;
     uint32_t expert_i1;
@@ -9874,23 +9883,59 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     uint32_t fusion_flags = 0;
+    float fuse_scale0 = 1.0f;
+    float fuse_scale1 = 1.0f;
 
     vk_subbuffer d_F0 = d_D;
-    if (ctx->num_additional_fused_ops > 0) {
-        const ggml_tensor * add = cgraph->nodes[node_idx + 1];
-        const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
-
-        d_F0 = ggml_vk_tensor_subbuffer(ctx, bias);
-        fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS0;
-    }
-
     vk_subbuffer d_F1 = d_D;
-    if (ctx->num_additional_fused_ops == 2) {
-        const ggml_tensor * add = cgraph->nodes[node_idx + 2];
-        const ggml_tensor * bias = add->src[0] == cgraph->nodes[node_idx + 1] ? add->src[1] : add->src[0];
+    if (ctx->num_additional_fused_ops > 0 && cgraph->nodes[node_idx + 1]->op == GGML_OP_ADD) {
+        {
+            const ggml_tensor * add = cgraph->nodes[node_idx + 1];
+            const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
 
-        d_F1 = ggml_vk_tensor_subbuffer(ctx, bias);
-        fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS1;
+            d_F0 = ggml_vk_tensor_subbuffer(ctx, bias);
+            fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS0;
+        }
+
+        if (ctx->num_additional_fused_ops == 2) {
+            const ggml_tensor * add = cgraph->nodes[node_idx + 2];
+            const ggml_tensor * bias = add->src[0] == cgraph->nodes[node_idx + 1] ? add->src[1] : add->src[0];
+
+            d_F1 = ggml_vk_tensor_subbuffer(ctx, bias);
+            fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS1;
+        }
+    } else if (ctx->num_additional_fused_ops > 0) {
+        // elementwise epilog chain, validated by ggml_vk_can_fuse_mmv_epilog
+        bool unary_seen = false;
+        for (int k = 1; k <= ctx->num_additional_fused_ops; ++k) {
+            const ggml_tensor * n = cgraph->nodes[node_idx + k];
+            switch (n->op) {
+            case GGML_OP_SCALE:
+                if (!unary_seen) {
+                    fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALEC0;
+                    fuse_scale0 = ggml_get_op_params_f32(n, 0);
+                } else {
+                    fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALEC1;
+                    fuse_scale1 = ggml_get_op_params_f32(n, 0);
+                }
+                break;
+            case GGML_OP_UNARY:
+                fusion_flags |= ggml_get_unary_op(n) == GGML_UNARY_OP_SILU ? MAT_VEC_FUSION_FLAGS_SILU
+                                                                           : MAT_VEC_FUSION_FLAGS_SIGMOID;
+                unary_seen = true;
+                break;
+            case GGML_OP_MUL: {
+                const ggml_tensor * prev  = cgraph->nodes[node_idx + k - 1];
+                const ggml_tensor * other = n->src[0] == prev ? n->src[1] : n->src[0];
+
+                d_F0 = ggml_vk_tensor_subbuffer(ctx, other);
+                fusion_flags |= MAT_VEC_FUSION_FLAGS_MUL0;
+                break;
+            }
+            default:
+                GGML_ABORT("invalid fused mat-vec epilog op");
+            }
+        }
     }
 
     ggml_pipeline_request_descriptor_sets(ctx, dmmv, CEIL_DIV(ne12 * ne13, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
@@ -9902,7 +9947,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         const vk_mat_vec_push_constants pc = {
             (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
             stride_batch_x, stride_batch_y, stride_batch_d,
-            fusion_flags, base_work_group_y,
+            fusion_flags, fuse_scale0, fuse_scale1, base_work_group_y,
             (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
@@ -10815,7 +10860,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         const vk_mat_vec_id_push_constants pc = {
             (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
             (uint32_t)(ne00 * ne01), stride_batch_y, (uint32_t)(ne20 * ne21),
-            fusion_flags,
+            fusion_flags, 1.0f, 1.0f,
             (uint32_t)nei0, (uint32_t)ne11, expert_i1, nbi1
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
@@ -17045,6 +17090,97 @@ static bool ggml_vk_is_empty(ggml_tensor * node) {
     return ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
 }
 
+// Match MUL_MAT followed by a chain of elementwise epilog ops handled by the
+// mat-vec shaders' fused epilog: an optional SCALE, an optional UNARY (SILU or
+// SIGMOID), an optional SCALE, and an optional trailing MUL, in that order.
+// The shader applies them in the same fixed order: scale0 -> unary -> scale1 -> mul.
+static bool ggml_vk_can_fuse_mmv_epilog(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
+                                        int node_idx, int num_extra) {
+    GGML_ASSERT(num_extra >= 1 && num_extra <= 3);
+    if (node_idx + num_extra >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * mm = cgraph->nodes[node_idx];
+    if (mm->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    // mat-vec only
+    if (ggml_nrows(mm) != 1) {
+        return false;
+    }
+    // restrict to the mul_mat_vec shader family: f16 srcs can route to the
+    // p021/nc shaders, which don't implement the fused epilog
+    const ggml_tensor * src0 = mm->src[0];
+    if (!(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
+        return false;
+    }
+    if (mm->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    enum ggml_op ops[4];
+    ops[0] = GGML_OP_MUL_MAT;
+
+    bool scale_pre  = false;
+    bool scale_post = false;
+    bool unary_seen = false;
+    bool mul_seen   = false;
+    for (int k = 1; k <= num_extra; ++k) {
+        const ggml_tensor * n    = cgraph->nodes[node_idx + k];
+        const ggml_tensor * prev = cgraph->nodes[node_idx + k - 1];
+        ops[k] = n->op;
+        switch (n->op) {
+        case GGML_OP_SCALE:
+            // one scale slot before the unary op and one after
+            if (mul_seen || (unary_seen ? scale_post : scale_pre)) {
+                return false;
+            }
+            // scale with bias isn't handled
+            if (ggml_get_op_params_f32(n, 1) != 0.0f) {
+                return false;
+            }
+            (unary_seen ? scale_post : scale_pre) = true;
+            break;
+        case GGML_OP_UNARY:
+            if (mul_seen || unary_seen) {
+                return false;
+            }
+            if (ggml_get_unary_op(n) != GGML_UNARY_OP_SILU &&
+                ggml_get_unary_op(n) != GGML_UNARY_OP_SIGMOID) {
+                return false;
+            }
+            unary_seen = true;
+            break;
+        case GGML_OP_MUL: {
+            if (mul_seen) {
+                return false;
+            }
+            if (n->src[0] != prev && n->src[1] != prev) {
+                return false;
+            }
+            const ggml_tensor * other = n->src[0] == prev ? n->src[1] : n->src[0];
+            // the shader reuses the D indexing for the mul operand
+            if (other->type != GGML_TYPE_F32 ||
+                !ggml_are_same_shape(n, other) ||
+                !ggml_are_same_stride(n, other) ||
+                get_misalign_bytes(ctx, other) != 0) {
+                return false;
+            }
+            mul_seen = true;
+            break;
+        }
+        default:
+            return false;
+        }
+        // epilog ops are elementwise on the mat-vec output
+        if (n->type != GGML_TYPE_F32 || !ggml_are_same_shape(n, mm)) {
+            return false;
+        }
+    }
+
+    return ggml_can_fuse(cgraph, node_idx, ops, num_extra + 1);
+}
+
 static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
@@ -17917,6 +18053,24 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ADD";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_mmv_epilog(ctx, cgraph, i, 3)) {
+                ctx->num_additional_fused_ops = 3;
+                fusion_string = "MUL_MAT_EPILOG";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
+                op_srcs_fused_elementwise[3] = true;
+            } else if (ggml_vk_can_fuse_mmv_epilog(ctx, cgraph, i, 2)) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "MUL_MAT_EPILOG";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
+            } else if (ggml_vk_can_fuse_mmv_epilog(ctx, cgraph, i, 1)) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "MUL_MAT_EPILOG";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ID_ADD_ID_MUL";
@@ -18356,8 +18510,35 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         // that we support (e.g. RMS_NORM + MUL).
         // This first pass only grabs "real" (non-view nodes). Second pass grabs view nodes.
         // The goal is to not interleave real and view nodes in a way that breaks fusion.
+        // Dependent op pairs that the backend can fuse (or chains thereof). A node may
+        // join the current set even when it depends on the previous node, if the pair is
+        // fusable - and the scan window is extended to keep such chains intact.
+        auto const &is_fusion_pair = [](const ggml_tensor *a, const ggml_tensor *b) -> bool {
+            return (a->op == GGML_OP_RMS_NORM   && b->op == GGML_OP_MUL)    ||
+                   (a->op == GGML_OP_MUL_MAT    && b->op == GGML_OP_ADD)    ||
+                   (a->op == GGML_OP_MUL_MAT_ID && b->op == GGML_OP_ADD_ID) ||
+                   (a->op == GGML_OP_MUL_MAT_ID && b->op == GGML_OP_MUL)    ||
+                   (a->op == GGML_OP_ADD        && b->op == GGML_OP_ADD)    ||
+                   (a->op == GGML_OP_SSM_CONV   && b->op == GGML_OP_ADD)    ||
+                   (a->op == GGML_OP_SSM_CONV   && b->op == GGML_OP_UNARY)  ||
+                   // mat-vec elementwise epilog chains (see ggml_vk_can_fuse_mmv_epilog)
+                   (a->op == GGML_OP_MUL_MAT    && b->op == GGML_OP_SCALE)  ||
+                   (a->op == GGML_OP_MUL_MAT    && b->op == GGML_OP_UNARY)  ||
+                   (a->op == GGML_OP_MUL_MAT    && b->op == GGML_OP_MUL)    ||
+                   (a->op == GGML_OP_SCALE      && b->op == GGML_OP_UNARY)  ||
+                   (a->op == GGML_OP_UNARY      && b->op == GGML_OP_SCALE)  ||
+                   (a->op == GGML_OP_UNARY      && b->op == GGML_OP_MUL);
+        };
+
         const int NUM_TO_CHECK = 20;
-        for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
+        for (int j = first_unused+1; j < graph->n_nodes; ++j) {
+            // scan a fixed window, but follow a fusable chain past its edge so the
+            // chain isn't split across sets (which would break fusion)
+            if (j >= first_unused + NUM_TO_CHECK &&
+                !(j == current_set.back() + 1 &&
+                  is_fusion_pair(graph->nodes[current_set.back()], graph->nodes[j]))) {
+                break;
+            }
             if (used[j]) {
                 continue;
             }
@@ -18392,13 +18573,7 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
             for (int c = first_unused; c < j; ++c) {
                 if (!used[c] &&
                     is_src_of(graph->nodes[j], graph->nodes[c]) &&
-                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL) &&
-                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
-                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
-                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
-                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
-                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD) &&
-                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY)) {
+                    !(j == c+1 && c == current_set.back() && is_fusion_pair(graph->nodes[c], graph->nodes[j]))) {
                     ok = false;
                     break;
                 }
