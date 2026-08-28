@@ -11162,6 +11162,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
     bool use_mask_opt = mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
+    if (getenv("GGML_VK_DEBUG_MASK_OPT")) {
+        fprintf(stderr, "MASKOPT: use=%d nem0=%u nem1=%u block_cols=%u\n",
+                (int) use_mask_opt, nem0, nem1, tuning_params.block_cols);
+    }
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff);
 
