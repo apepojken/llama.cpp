@@ -291,9 +291,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
 
     // collapse the streams by their mean
+    // the first slice stays a view: the first add produces the contiguous tensor,
+    // saving a full-size copy per hc_mix (~1ms x 95 per 2048-token prefill chunk)
     ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
             ggml_row_size(gated->type, n_embd) * hc, 0);
-    mixed = ggml_cont(ctx0, mixed);
     for (int64_t c = 1; c < hc; ++c) {
         ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
                 ggml_row_size(gated->type, n_embd) * hc,
@@ -304,9 +305,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     cb(mixed, "hc_mixed", il);
 
     if (inject) {
-        // fold the combine-gate activation onto the inject mat-vec so the
-        // backend can fuse mat-vec + scale + sigmoid + scale into one dispatch
-        ggml_tensor * w = build_lora_mm(w_inject, xn);
+        // decode: plain mat-vec, so the backend fuses mat-vec + scale + sigmoid + scale.
+        // batched prefill: m=4 wastes 15/16 of every MM tile (measured 77 GFLOPS beside
+        // 6-17 TFLOPS neighbors); computing the transpose routes through the mat-vec
+        // shaders (4 columns <= the 8-column limit) and a tiny [nt,4] transpose restores
+        // the layout.
+        ggml_tensor * w;
+        if (nt > 8) {
+            w = ggml_mul_mat(ctx0, xn, w_inject);
+            w = ggml_cont(ctx0, ggml_transpose(ctx0, w));
+        } else {
+            w = build_lora_mm(w_inject, xn);
+        }
         w = ggml_scale(ctx0, ggml_sigmoid(ctx0, ggml_scale(ctx0, w, 1.0f / (float) hc)), 2.0f);
         *inject = w;
         cb(*inject, "hc_inject", il);
@@ -599,9 +609,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
     ggml_tensor * pooled = nullptr;
     for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_cont(ctx0,
-                ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
-                        members->nb[2], members->nb[3], i*members->nb[1]));
+        ggml_tensor * slice = ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
+                members->nb[2], members->nb[3], i*members->nb[1]);
+        // r >= 2, so the first add materializes the contiguous sum without a copy
         pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
     }
     pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
