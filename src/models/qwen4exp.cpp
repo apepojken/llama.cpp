@@ -554,7 +554,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         // shaders (4 columns <= the 8-column limit) and a tiny [nt,4] transpose restores
         // the layout.
         ggml_tensor * w;
-        if (nt > 8) {
+        // the transpose path puts w_inject on the mul_mat B side, which the Vulkan mat-vec
+        // accepts only as f32/f16/q8_1 - a quantized inject weight asserts there. Only take
+        // it when w_inject is unquantized; otherwise use the normal weight-as-A path.
+        const bool w_inject_unquant = w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_F16;
+        if (nt > 8 && w_inject_unquant) {
             w = ggml_mul_mat(ctx0, xn, w_inject);
             w = ggml_cont(ctx0, ggml_transpose(ctx0, w));
         } else {
