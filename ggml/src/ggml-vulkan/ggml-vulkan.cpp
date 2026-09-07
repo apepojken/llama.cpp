@@ -17835,6 +17835,10 @@ static bool ggml_vk_can_fuse_mul_bcast_add(ggml_backend_vk_context * ctx, const 
     if (!ggml_can_repeat(a, add) || !ggml_can_repeat(w, add)) {
         return false;
     }
+    // the shader indexes with 32-bit arithmetic
+    if (ggml_nelements(add) > (int64_t) UINT32_MAX) {
+        return false;
+    }
     // anything interleaved in the span must be an empty view op
     for (int i = node_idx + 1; i < add_idx; ++i) {
         if (i == mul_idx) {
