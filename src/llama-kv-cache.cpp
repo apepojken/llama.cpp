@@ -574,7 +574,6 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     }
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -582,6 +581,13 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     if (shift == 0) {
         return;
     }
+
+    // [TAG_HYBRID_MID_RM] M-RoPE (n_pos_per_embd > 1) used to be refused here. Every position
+    // component of a cell (pos, and the spatial extent x/y, which for text equals pos and for image
+    // patches is an absolute offset from the image's start) moves by the same delta under a context
+    // shift, and the K-shift graph rotates the whole vector by that one delta per cell (see
+    // build_rope_shift), so shifting pos and the extent together is exact. A sliding window needs it.
+    const bool shift_ext = hparams.n_pos_per_embd() > 1;
 
     uint32_t new_head = cells.size();
 
@@ -604,6 +610,12 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         }
 
         if (cells.seq_has(i, seq_id)) {
+            if (shift_ext) {
+                llama_kv_cell_ext e = cells.ext_get(i);
+                e.x += shift;
+                e.y += shift;
+                cells.ext_set(i, e);
+            }
             if (cells.pos_add(i, shift)) {
                 if (new_head == cells.size()) {
                     new_head = i;
@@ -1190,7 +1202,11 @@ bool llama_kv_cache::get_can_shift() const {
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
-    if (hparams.n_pos_per_embd() > 1) {
+    // [TAG_HYBRID_MID_RM] M-RoPE used to return false here. seq_add now moves pos and the spatial
+    // extent by the same delta, and build_rope_shift rotates the whole vector by that delta
+    // (the NEOX whole-vector workaround), so the K-shift is exact for text and for image patches
+    // whose extent is an absolute offset. LLAMA_KV_NO_MROPE_SHIFT=1 restores the refusal.
+    if (hparams.n_pos_per_embd() > 1 && getenv("LLAMA_KV_NO_MROPE_SHIFT") != nullptr) {
         return false;
     }
     return true;
