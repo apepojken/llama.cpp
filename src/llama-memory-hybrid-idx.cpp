@@ -5,6 +5,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cassert>
@@ -61,7 +62,65 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    // [TAG_QSA_POOLED_CACHE] one f32 row per block id per QSA layer; single-stream memories
+    // only (a unified cache shares one stream, and rows are shared across its sequences)
+    if (mem_idx && mem_idx->get_n_stream() == 1) {
+        uint32_t ratio = 0;
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            if (model.hparams.dsv4_compress_ratios[il] > 0) {
+                ratio = model.hparams.dsv4_compress_ratios[il];
+                break;
+            }
+        }
+
+        const uint32_t idx_dim = model.hparams.indexer_head_size;
+
+        if (ratio > 0 && idx_dim > 0) {
+            // + 1 so the spare block has a row, + 1 dustbin row for padded writes
+            pooled_rows  = kv_size/ratio + 2;
+            pooled_ratio = ratio;
+
+            ggml_init_params ip = {
+                /*.mem_size   =*/ 2*model.hparams.n_layer()*ggml_tensor_overhead(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            pooled_ctx.reset(ggml_init(ip));
+
+            ggml_backend_buffer_type_t buft = nullptr;
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                // the idx cache is filtered to the QSA layers; get_k_storage on any other
+                // layer is out of range
+                if (model.hparams.dsv4_compress_ratios[il] == 0) {
+                    continue;
+                }
+                ggml_tensor * k = mem_idx->get_k_storage(il);
+                if (k == nullptr) {
+                    continue;
+                }
+                if (buft == nullptr) {
+                    buft = ggml_backend_buffer_get_type(k->buffer);
+                }
+                ggml_tensor * t = ggml_new_tensor_2d(pooled_ctx.get(), GGML_TYPE_F32, idx_dim, pooled_rows);
+                ggml_format_name(t, "idx_pooled_l%u", il);
+                pooled_k[(int32_t) il] = t;
+            }
+
+            if (!pooled_k.empty()) {
+                pooled_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pooled_ctx.get(), buft));
+                GGML_ASSERT(pooled_buf && "failed to allocate the pooled indexer key cache");
+
+                // finite from the start: unpooled rows are masked, never read as nan
+                ggml_backend_buffer_clear(pooled_buf.get(), 0);
+
+                LLAMA_LOG_INFO("%s: pooled indexer key cache, %zu layers x %u rows, %.2f MiB\n",
+                        __func__, pooled_k.size(), pooled_rows,
+                        ggml_backend_buffer_get_size(pooled_buf.get())/1024.0/1024.0);
+            }
+        }
+    }
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -142,6 +201,9 @@ void llama_memory_hybrid_idx::clear(bool data) {
     if (mem_idx) {
         mem_idx->clear(data);
     }
+
+    // [TAG_QSA_POOLED_CACHE]
+    pooled_reset(-1);
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -154,6 +216,9 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         mem_idx->seq_rm(seq_id, p0, p1);
     }
 
+    // [TAG_QSA_POOLED_CACHE]
+    pooled_rm(seq_id, p0, p1);
+
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
 }
 
@@ -163,6 +228,10 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
     if (mem_idx) {
         mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     }
+
+    // [TAG_QSA_POOLED_CACHE] rows are shared in the single-stream cache; the copy's blocks
+    // are refilled from its own cells on its first ubatch
+    pooled_reset(seq_id_dst);
 }
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
@@ -171,6 +240,11 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
     if (mem_idx) {
         mem_idx->seq_keep(seq_id);
     }
+
+    // [TAG_QSA_POOLED_CACHE] only seq_id's rows survive as trusted
+    const int64_t keep = pooled_w.count(seq_id) ? pooled_w[seq_id] : 0;
+    pooled_w.clear();
+    pooled_w[seq_id] = keep;
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -179,6 +253,9 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
     if (mem_idx) {
         mem_idx->seq_add(seq_id, p0, p1, shift);
     }
+
+    // [TAG_QSA_POOLED_CACHE] shifting positions remaps every block
+    pooled_reset(seq_id);
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -187,6 +264,9 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
     if (mem_idx) {
         mem_idx->seq_div(seq_id, p0, p1, d);
     }
+
+    // [TAG_QSA_POOLED_CACHE]
+    pooled_reset(seq_id);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_breakdown() const {
@@ -244,6 +324,14 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 
         throw;
     }
+
+    // [TAG_QSA_POOLED_CACHE] a full restore rewrites the indexer cells with arbitrary content,
+    // so no pooled row can be trusted; the next ubatch refills the whole range. A PARTIAL_ONLY
+    // restore (speculative checkpoint replay) leaves the cells untouched, and its rollback
+    // arrives through seq_rm, which already clamped the watermark.
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        pooled_reset(seq_id);
+    }
 }
 
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
@@ -260,10 +348,48 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, -1, -1);
     }
+
+    // [TAG_QSA_POOLED_CACHE]
+    pooled_reset(seq_id);
 }
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
+}
+
+// [TAG_QSA_POOLED_CACHE]
+
+ggml_tensor * llama_memory_hybrid_idx::get_pooled_k(int32_t il) const {
+    const auto it = pooled_k.find(il);
+    return it == pooled_k.end() ? nullptr : it->second;
+}
+
+int64_t & llama_memory_hybrid_idx::pooled_valid(llama_seq_id seq_id) const {
+    return pooled_w[seq_id];
+}
+
+void llama_memory_hybrid_idx::pooled_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (pooled_k.empty()) {
+        return;
+    }
+    if (p0 <= 0 && p1 < 0) {
+        pooled_w[seq_id] = 0;
+        return;
+    }
+    // blocks at or beyond the first removed position lose members; earlier rows keep their
+    // content (removals only ever drop the tail or a middle range, never rewrite the prefix)
+    const int64_t blk = pooled_ratio > 0 ? std::max<llama_pos>(p0, 0)/pooled_ratio : 0;
+
+    auto & w = pooled_w[seq_id];
+    w = std::min(w, blk);
+}
+
+void llama_memory_hybrid_idx::pooled_reset(llama_seq_id seq_id) {
+    if (seq_id < 0) {
+        pooled_w.clear();
+    } else {
+        pooled_w[seq_id] = 0;
+    }
 }
 
 void llama_memory_hybrid_idx::set_input_qsa(
@@ -273,25 +399,42 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        int64_t n_kv,
+        ggml_tensor * dirty_cells,
+        ggml_tensor * dirty_pos,
+        ggml_tensor * dirty_rows,
+        ggml_tensor * tail_cells,
+        ggml_tensor * tail_mask) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
+    GGML_ASSERT((dirty_cells == nullptr) == (dirty_rows == nullptr) && (dirty_pos == nullptr) == (dirty_rows == nullptr));
+    GGML_ASSERT((tail_cells == nullptr) == (tail_mask == nullptr));
+    GGML_ASSERT(tail_cells == nullptr || blk_bias);
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    // the block-level selection passes no cell_blk: it never expands per cell
+    GGML_ASSERT(cell_blk == nullptr || ggml_backend_buffer_is_host(cell_blk->buffer));
+    GGML_ASSERT(cell_blk == nullptr || cell_blk->ne[0] == n_kv);
 
-    const int64_t n_kv     = cell_blk->ne[0];
-    const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
-    const int64_t n_blocks = blk_pos->ne[0]/(4*n_ns);
+    const int64_t n_ns     = blk_cells->ne[1];       // streams in this ubatch
+    const int64_t n_blocks = blk_cells->ne[0]/ratio;
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t r        = ratio;
 
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
-    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+    int32_t * dst_cell_blk  = cell_blk ? (int32_t *) cell_blk->data : nullptr;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
-    int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
     float   * dst_bias      = (float   *) bias->data;
+
+    // [TAG_QSA_POOLED_CACHE] the pooled path takes the block positions through dirty_pos, so
+    // the graph has no blk_pos input then; the fill below still needs the table, so build it locally
+    std::vector<int32_t> loc_blk_pos;
+    if (blk_pos == nullptr) {
+        loc_blk_pos.assign(4*n_blocks*n_ns, 0);
+    }
+    int32_t * dst_blk_pos   = blk_pos ? (int32_t *) blk_pos->data : loc_blk_pos.data();
 
     // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
     // from zero, so the bucket alone would pool two sequences into one block
@@ -315,6 +458,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
     std::vector<int32_t> order;
     std::vector<int32_t> rank;
 
+    // the unpooled (tail) cells of the stream, for the per-query tail rows of the gather path
+    std::vector<int32_t> dead_j;
+
     std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_ns, 0);
 
     for (int64_t s = 0; s < n_ns; ++s) {
@@ -322,7 +468,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const auto & cells = get_mem_idx()->get_cells(seq_of_stream);
 
-        int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
+        int32_t * cur_cell_blk  = dst_cell_blk ? dst_cell_blk + s*n_kv : nullptr;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
 
         std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
@@ -493,6 +639,16 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const bool     have_dead = n_bid < n_blocks;
         const int32_t  dead_bid  = have_dead ? n_bid : n_blocks - 1;
 
+        // the spare block's member row holds the unpooled cells themselves, so a block-level
+        // selection that picks the spare block (its bias makes sure it does) expands to the real
+        // tail. slots past the last one repeat the first: the selection only unmasks rows, so a
+        // repeat is harmless. with several sequences in one stream the row is shared, so more
+        // than r unpooled cells in a stream leave some of them out of the block-level selection
+        int32_t n_dead       = 0;
+        int64_t dead_idx_min = INT64_MAX;   // earliest unpooled cell, to tell if a query can see the tail
+
+        dead_j.clear();
+
         for (int64_t j = 0; j < n_kv; ++j) {
             const int32_t g = cell_grp[j];
 
@@ -502,9 +658,94 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
 
                 cur_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
+            } else if (have_dead && !cells.is_empty(j)) {
+                if (n_dead < (int32_t) r) {
+                    cur_blk_cells[dead_bid*r + n_dead] = (int32_t) j;
+                }
+                n_dead++;
+                dead_idx_min = std::min<int64_t>(dead_idx_min, ranked ? rank[j] : cells.pos_get(j));
+                dead_j.push_back((int32_t) j);
             }
 
-            cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+            if (cur_cell_blk) {
+                cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+            }
+        }
+
+        if (have_dead && n_dead > 0) {
+            if (n_dead > (int32_t) r) {
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    LLAMA_LOG_WARN("%s: %d unpooled cells in one stream exceed the spare block row (%u); the rest are left out of the block-level selection\n",
+                            __func__, n_dead, (unsigned) r);
+                }
+            }
+
+            for (int32_t k = std::min<int32_t>(n_dead, (int32_t) r); k < (int32_t) r; ++k) {
+                cur_blk_cells[dead_bid*r + k] = cur_blk_cells[dead_bid*r];
+            }
+        }
+
+        // [TAG_QSA_POOLED_CACHE] resolve which blocks the graph must (re)pool this ubatch: the
+        // range from the sequence's watermark to its last complete block, in block-id space.
+        // Rows are indexed by block id; with one sequence and no holes id b covers positions
+        // [b*r, (b+1)*r), so it equals the position block the watermark counts in. Complete
+        // blocks are immutable and ids append-only there, so rows below the watermark stay
+        // valid; rollbacks arrive as seq_rm/state_read, which clamp the watermark first.
+        // note: the watermark advances here, before the compute runs. A failed-and-retried
+        // compute would skip the range on the retry; that class of failure already corrupts the
+        // recurrent states (written during compute), so the whole architecture assumes
+        // set_input -> successful compute, and this bookkeeping shares that assumption.
+        if (dirty_rows != nullptr) {
+            GGML_ASSERT(n_ns == 1 && "the pooled cache path is single-stream only");
+
+            const int64_t n_dirty_max = dirty_rows->ne[0];
+            const int64_t dustbin     = (int64_t) pooled_rows - 1;
+
+            int32_t * dst_d_cells = (int32_t *) dirty_cells->data;
+            int32_t * dst_d_pos   = (int32_t *) dirty_pos->data;
+            int64_t * dst_d_rows  = (int64_t *) dirty_rows->data;
+
+            // the id <-> position-block identity the row layout relies on (ranks stand in for
+            // positions with 2d mrope, and are contiguous as well)
+            bool identity = one_seq;
+            for (int32_t b = 0; identity && b < n_bid; ++b) {
+                identity = bid_idx[b] == b*r;
+            }
+
+            auto & w = pooled_valid(seq_of_stream);
+
+            if (!identity) {
+                // a second sequence or a hole: ids no longer track positions, so nothing below
+                // the watermark can be trusted. refill from the start; what the tables cannot
+                // hold this ubatch is picked up by the next one (its capacity grows with the gap)
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    LLAMA_LOG_WARN("%s: block ids diverged from positions (%d blocks); refilling the pooled cache\n", __func__, n_bid);
+                }
+                w = 0;
+            }
+
+            w = std::min<int64_t>(w, n_bid);
+
+            const int64_t n_dirty = std::min<int64_t>(n_bid - w, n_dirty_max);
+
+            for (int64_t i = 0; i < n_dirty_max; ++i) {
+                const bool    live = i < n_dirty;
+                const int64_t b    = w + i;
+
+                dst_d_rows[i] = live ? b : dustbin;
+                for (int64_t sec = 0; sec < 4; ++sec) {
+                    dst_d_pos[sec*n_dirty_max + i] = live ? dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] : 0;
+                }
+                for (int64_t j = 0; j < r; ++j) {
+                    dst_d_cells[i*r + j] = live ? cur_blk_cells[b*r + j] : 0;
+                }
+            }
+
+            w += n_dirty;
         }
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {
@@ -550,15 +791,63 @@ void llama_memory_hybrid_idx::set_input_qsa(
                         continue;
                     }
 
-                    // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = bid_idx[b] >= tail_start ? 1e9f : 0.0f;
+                    // a block that starts past the query is wholly in the future. the attention
+                    // mask hides its cells, but the block-level selection runs before that mask,
+                    // so it must not spend a slot on it (in a prefill ubatch that would be most
+                    // of the budget for the early queries). the query's own partial block is the
+                    // always-visible tail; the complete blocks before it compete on their score.
+                    // finite where a cell can be seen, so a -inf never meets a 1e9 and makes a nan
+                    if (bid_idx[b] > q) {
+                        cur_blk_bias[b] = -INFINITY;
+                    } else {
+                        cur_blk_bias[b] = bid_idx[b] >= tail_start ? 1e9f : 0.0f;
+                    }
                 }
 
                 // the spare block holds the unpooled cells, which are the incomplete tail, so
-                // it gets the tail value. it must stay finite: a sequence with fewer than
-                // `ratio` cells owns no full block, and a row of -inf only gives a nan.
+                // it gets the tail value while any of them is visible to this query. it must
+                // stay finite then: a sequence with fewer than `ratio` cells owns no full block,
+                // and a row of -inf only gives a nan. with nothing unpooled (or all of it in the
+                // future) the spare row must not win a slot; some full block is finite then
                 if (have_dead) {
-                    cur_blk_bias[dead_bid] = 1e9f;
+                    cur_blk_bias[dead_bid] = (tail_cells == nullptr && n_dead > 0 && dead_idx_min <= q) ? 1e9f : -INFINITY;
+                }
+
+                // [TAG_QSA_GATHER] the gathered attention takes the tail as rows of its own: this
+                // query's visible unpooled cells, one slot each; pad slots repeat the first cell
+                // (or 0) and are masked, so no row is ever attended twice
+                if (tail_cells != nullptr) {
+                    GGML_ASSERT(n_ns == 1 && "the gathered QSA attention is single-stream only");
+
+                    int32_t * cur_tail_cells = (int32_t *) tail_cells->data + i*r;
+                    float   * cur_tail_mask  = (float   *) tail_mask->data  + i*r;
+
+                    int32_t k = 0;
+                    for (const int32_t j : dead_j) {
+                        const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+                        if (idx > q || !cells.seq_has((uint32_t) j, seq_id)) {
+                            continue;
+                        }
+                        if (k < (int32_t) r) {
+                            cur_tail_cells[k] = j;
+                            cur_tail_mask[k]  = 0.0f;
+                        }
+                        k++;
+                    }
+
+                    if (k > (int32_t) r) {
+                        static bool warned = false;
+                        if (!warned) {
+                            warned = true;
+                            LLAMA_LOG_WARN("%s: %d visible unpooled cells exceed the tail rows (%u); the rest are left out of the gathered attention\n",
+                                    __func__, k, (unsigned) r);
+                        }
+                    }
+
+                    for (int32_t p = std::min<int32_t>(k, (int32_t) r); p < (int32_t) r; ++p) {
+                        cur_tail_cells[p] = k > 0 ? cur_tail_cells[0] : 0;
+                        cur_tail_mask[p]  = -INFINITY;
+                    }
                 }
 
                 continue;
@@ -665,6 +954,56 @@ uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
     return ns_ubatch[i_cur];
 }
 
+// [TAG_QSA_POOLED_CACHE]
+
+ggml_tensor * llama_memory_hybrid_idx_context::get_pooled_k(int32_t il) const {
+    return mem != nullptr && get_idx() != nullptr ? mem->get_pooled_k(il) : nullptr;
+}
+
+uint32_t llama_memory_hybrid_idx_context::get_pooled_rows() const {
+    return mem != nullptr ? mem->get_pooled_rows() : 0;
+}
+
+uint32_t llama_memory_hybrid_idx_context::qsa_pooled_n_dirty_max(const llama_ubatch & ubatch, uint32_t ratio) const {
+    GGML_ASSERT(ratio > 0);
+    GGML_ASSERT(mem != nullptr);
+
+    // the reserve pass builds worst-case graphs from a mock ubatch with no seq/pos data;
+    // give it the per-ubatch bound (the refill after a state load resizes on a live ubatch)
+    if (ubatch.seq_id == nullptr || ubatch.seq_id[0] == nullptr || ubatch.pos == nullptr) {
+        return (ubatch.n_tokens + ratio - 1)/ratio + 1;
+    }
+
+    // block ids track positions only while one sequence owns the stream: with two, their
+    // blocks interleave in id space and a new block of one shifts the ids of the other
+    const llama_seq_id seq = ubatch.seq_id[0][0];
+
+    {
+        const auto & cells = mem->get_mem_idx()->get_cells(seq);
+
+        int n_seq_present = 0;
+        for (int sq = 0; sq < LLAMA_MAX_SEQ && n_seq_present < 2; ++sq) {
+            if (cells.seq_pos_min(sq) >= 0) {
+                n_seq_present++;
+            }
+        }
+
+        if (n_seq_present > 1) {
+            return 0;
+        }
+    }
+
+    llama_pos q_max = -1;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        q_max = std::max(q_max, ubatch.pos[i]);
+    }
+
+    const int64_t n_complete = (int64_t) (q_max + 1)/ratio;
+    const int64_t w          = std::min(mem->pooled_valid(seq), n_complete);
+
+    return (uint32_t) std::max<int64_t>(1, n_complete - w);
+}
+
 void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
@@ -672,8 +1011,15 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        ggml_tensor * dirty_cells,
+        ggml_tensor * dirty_pos,
+        ggml_tensor * dirty_rows,
+        ggml_tensor * tail_cells,
+        ggml_tensor * tail_mask) const {
     GGML_ASSERT(mem != nullptr);
+    GGML_ASSERT(get_idx() != nullptr);
 
-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, get_idx()->get_n_kv(),
+            dirty_cells, dirty_pos, dirty_rows, tail_cells, tail_mask);
 }
