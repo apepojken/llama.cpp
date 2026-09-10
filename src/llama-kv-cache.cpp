@@ -1928,6 +1928,7 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
                 ggml_tensor * factors,
                       float   freq_base,
                       float   freq_scale,
+                    int64_t   n_offs,
                    uint32_t   il) const {
     const auto & n_ctx_orig = cparams.n_ctx_orig_yarn;
 
@@ -1947,6 +1948,13 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
     ggml_tensor * tmp;
 
     if (ggml_is_quantized(cur->type)) {
+        // [TAG_KV_SHIFT_HADAMARD] the hadamard rotation spans the whole head, so `cur` covers the
+        // whole head here (build_graph_shift), not just the rotary dims: reshaping a view of only
+        // the rotary dims to the rotation's width would mix several heads into one vector and
+        // destroy every shifted cell. Rope still touches only [n_offs, n_offs + n_rot) once the
+        // rotation is undone.
+        GGML_ASSERT(cur->ne[0] == rot->ne[0] && "K-shift: the hadamard rotation must cover the whole head");
+
         // dequantize to f32 -> RoPE -> quantize back
         tmp = ggml_cast(ctx, cur, GGML_TYPE_F32);
 
@@ -1956,6 +1964,10 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
         tmp = ggml_rope_ext(ctx, tmp,
                 shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                 yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+
+        if (n_offs > 0) {
+            ggml_rope_set_offset(tmp, n_offs);
+        }
 
         // rotate fwd
         tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
@@ -2033,14 +2045,25 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
+        // [TAG_KV_SHIFT_HADAMARD] with the hadamard rotation on (quantized K), the stored vector is
+        // rotated across the WHOLE head, so the shift has to undo the rotation on the whole head and
+        // rope inside it at n_embd_nope. Without the rotation, the rotary dims alone are enough.
+        const bool rot_full = inp->k_rot != nullptr;
+
         ggml_tensor * k =
-            ggml_view_3d(ctx, layer.k,
+            rot_full
+            ? ggml_view_3d(ctx, layer.k,
+                n_embd_head_k, n_head_kv, get_size()*n_stream,
+                ggml_row_size(layer.k->type, n_embd_head_k),
+                ggml_row_size(layer.k->type, n_embd_k_gqa),
+                0)
+            : ggml_view_3d(ctx, layer.k,
                 n_rot, n_head_kv, get_size()*n_stream,
                 ggml_row_size(layer.k->type, n_embd_head_k),
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
                 ggml_row_size(layer.k->type, n_embd_nope));
 
-        ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);
+        ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, rot_full ? n_embd_nope : 0, il);
 
         ggml_build_forward_expand(gf, cur);
     }

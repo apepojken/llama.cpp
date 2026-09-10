@@ -327,6 +327,7 @@ private:
                     ggml_tensor * factors,
                           float   freq_base,
                           float   freq_scale,
+                        int64_t   n_offs,
                        uint32_t   il) const;
 
     ggml_cgraph * build_graph_shift(
