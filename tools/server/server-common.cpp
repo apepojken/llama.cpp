@@ -462,6 +462,169 @@ std::string server_tokens::str() const {
     return oss.str();
 }
 
+std::vector<llama_pos> server_tokens::pos_map() const {
+    // [TAG_REUSE_MTMD]
+    std::vector<llama_pos> res(tokens.size() + 1, 0);
+
+    size_t    idx = 0;
+    llama_pos pos = 0;
+
+    while (idx < tokens.size()) {
+        const auto media_it = map_idx_to_media.find(idx);
+
+        if (media_it != map_idx_to_media.end()) {
+            const auto & chunk = media_it->second;
+
+            const llama_pos n_pos = mtmd_input_chunk_get_n_pos   (chunk.get());
+            const size_t    n_tok = mtmd_input_chunk_get_n_tokens(chunk.get());
+
+            GGML_ASSERT(n_tok > 0 && "Invalid media chunk");
+
+            for (size_t k = 0; k < n_tok && idx + k < tokens.size(); ++k) {
+                res[idx + k] = pos;
+            }
+
+            pos += n_pos;
+            idx += n_tok;
+        } else {
+            res[idx] = pos;
+
+            pos++;
+            idx++;
+        }
+    }
+
+    res[tokens.size()] = pos;
+
+    return res;
+}
+
+size_t server_tokens::match_run(size_t i, const server_tokens & b, size_t j) const {
+    // [TAG_REUSE_MTMD]
+    size_t n = 0;
+
+    while (i + n < tokens.size() && j + n < b.tokens.size()) {
+        const llama_token ai =   tokens[i + n];
+        const llama_token bj = b.tokens[j + n];
+
+        if (ai == LLAMA_TOKEN_NULL || bj == LLAMA_TOKEN_NULL) {
+            const auto ia =   map_idx_to_media.find(i + n);
+            const auto ib = b.map_idx_to_media.find(j + n);
+
+            // an index inside a chunk has no entry: a run can neither start nor continue there
+            if (ia == map_idx_to_media.end() || ib == b.map_idx_to_media.end()) {
+                break;
+            }
+
+            const size_t n_tok_a = mtmd_input_chunk_get_n_tokens(ia->second.get());
+            const size_t n_tok_b = mtmd_input_chunk_get_n_tokens(ib->second.get());
+
+            if (n_tok_a == 0 || n_tok_a != n_tok_b) {
+                break;
+            }
+
+            if (i + n + n_tok_a > tokens.size() || j + n + n_tok_b > b.tokens.size()) {
+                break;
+            }
+
+            const std::string id_a = mtmd_input_chunk_get_id(ia->second.get());
+            const std::string id_b = mtmd_input_chunk_get_id(ib->second.get());
+
+            if (id_a != id_b) {
+                break;
+            }
+
+            n += n_tok_a;
+
+            continue;
+        }
+
+        if (ai != bj) {
+            break;
+        }
+
+        n++;
+    }
+
+    return n;
+}
+
+void server_tokens::move_range(size_t dst, size_t src, size_t n) {
+    // [TAG_REUSE_MTMD]
+    GGML_ASSERT(dst <= src);
+    GGML_ASSERT(src + n <= tokens.size());
+
+    if (dst == src || n == 0) {
+        return;
+    }
+
+    for (size_t k = 0; k < n; ++k) {
+        tokens[dst + k] = tokens[src + k];
+    }
+
+    if (map_idx_to_media.empty()) {
+        return;
+    }
+
+    // the destination range is overwritten, so the chunks that were there are gone (the caller
+    // evicts their cells in the same step); the chunks inside the source range move with it
+    std::map<size_t, mtmd::input_chunk_ptr> moved;
+
+    for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ) {
+        if (it->first >= dst && it->first < src + n) {
+            if (it->first >= src) {
+                moved.emplace(it->first - (src - dst), std::move(it->second));
+            }
+
+            it = map_idx_to_media.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    for (auto & e : moved) {
+        map_idx_to_media.emplace(e.first, std::move(e.second));
+    }
+}
+
+void server_tokens::drop_range(size_t keep_head, size_t cut) {
+    // [TAG_PROMPT_TRUNCATE]
+    GGML_ASSERT(keep_head <= cut && cut <= tokens.size());
+
+    if (cut == keep_head) {
+        return;
+    }
+
+    const size_t n_tail = tokens.size() - cut;
+
+    move_range(keep_head, cut, n_tail);
+    keep_first(keep_head + n_tail);
+}
+
+size_t server_tokens::next_boundary(size_t idx) const {
+    // [TAG_PROMPT_TRUNCATE]
+    if (map_idx_to_media.empty() || idx >= tokens.size()) {
+        return idx;
+    }
+
+    auto it = map_idx_to_media.upper_bound(idx);
+
+    if (it == map_idx_to_media.begin()) {
+        return idx;
+    }
+
+    --it; // the last chunk starting at or before idx
+
+    const size_t start = it->first;
+    const size_t n_tok = mtmd_input_chunk_get_n_tokens(it->second.get());
+
+    if (idx < start + n_tok) {
+        return std::min(start + n_tok, tokens.size());
+    }
+
+    return idx;
+}
+
 const mtmd::input_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
     auto it = map_idx_to_media.find(idx);
     if (it != map_idx_to_media.end()) {

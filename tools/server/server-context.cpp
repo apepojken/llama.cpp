@@ -1176,9 +1176,11 @@ private:
                 SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
             }
 
+            // [TAG_REUSE_MTMD] cache reuse works with a projector loaded: the reuse loop matches a
+            // media chunk as a whole against the same chunk (by id) and moves its cells and its
+            // entry in the media map with the rest of the run
             if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
+                SRV_WRN("%s\n", "cache_reuse stays on with multimodal: media chunks are matched and shifted whole");
             }
         }
 
@@ -3210,9 +3212,7 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
-                                const bool can_cache_reuse =
-                                    llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                const bool can_cache_reuse = llama_memory_can_shift(llama_get_memory(ctx_tgt));
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -3220,43 +3220,39 @@ private:
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
                                 if (can_cache_reuse && n_cache_reuse > 0) {
-                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
-
                                     size_t head_c = n_past; // cache
                                     size_t head_p = n_past; // current prompt
 
-                                    if (mctx) {
-                                        // we should never reach this
-                                        GGML_ABORT("not supported by multimodal");
-                                    }
+                                    // [TAG_REUSE_MTMD] with media in the list a token index is no
+                                    // longer its position, and the cached list is rewritten as runs
+                                    // move, so take the layout the cells were built with up front.
+                                    // Both sides agree on [0, head_p) at every step, so the new
+                                    // prompt's map gives the position a moved run must land on.
+                                    const std::vector<llama_pos> pos_c = slot.prompt.tokens.pos_map();
+                                    const std::vector<llama_pos> pos_p = input_tokens.pos_map();
 
                                     SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
 
                                     while (head_c < slot.prompt.tokens.size() &&
                                            head_p < input_tokens.size()) {
 
-                                        size_t n_match = 0;
-                                        while (head_c + n_match < slot.prompt.tokens.size() &&
-                                               head_p + n_match < input_tokens.size()       &&
-                                               slot.prompt.tokens[head_c + n_match] == input_tokens[head_p + n_match]) {
-                                            n_match++;
-                                        }
+                                        // media matches only as a whole chunk against the same
+                                        // chunk, so a run never starts or ends inside one
+                                        const size_t n_match = slot.prompt.tokens.match_run(head_c, input_tokens, head_p);
 
                                         if (n_match >= (size_t) n_cache_reuse) {
-                                            SLT_TRC(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n", n_match, head_c, head_c + n_match, head_p, head_p + n_match);
-                                            //for (size_t i = head_p; i < head_p + n_match; i++) {
-                                            //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx_tgt, prompt_tokens[i]).c_str());
-                                            //}
+                                            const llama_pos p_dst = pos_p[head_p];
+                                            const llama_pos p_src = pos_c[head_c];
+                                            const llama_pos p_end = pos_c[head_c + n_match];
 
-                                            const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
+                                            SLT_TRC(slot, "reusing chunk with size %zu, shifting KV cache [%d, %d) -> [%d, %d)\n", n_match, p_src, p_end, p_dst, p_dst + (p_end - p_src));
 
-                                            slot.mem.seq_rm (slot.id, head_p, head_c);
-                                            slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
+                                            slot.mem.seq_rm (slot.id, p_dst, p_src);
+                                            slot.mem.seq_add(slot.id, p_src, p_end, (llama_pos) (p_dst - p_src));
 
-                                            for (size_t i = 0; i < n_match; i++) {
-                                                slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
-                                                n_past++;
-                                            }
+                                            slot.prompt.tokens.move_range(head_p, head_c, n_match);
+
+                                            n_past += (int) n_match;
 
                                             head_c += n_match;
                                             head_p += n_match;

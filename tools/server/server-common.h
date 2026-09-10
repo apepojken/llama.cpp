@@ -184,6 +184,35 @@ public:
     // number of tokens with position < max_pos
     size_t size_up_to_pos(llama_pos max_pos) const;
 
+    // [TAG_REUSE_MTMD] whether any media chunk is actually present. has_mtmd only says the server
+    // was started with a projector, so every container carries it once one is loaded
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
+    // [TAG_REUSE_MTMD] the position of every token index, plus the position after the last one.
+    // An image occupies several tokens but a different number of positions, so index != position
+    // as soon as media is in the list; cache reuse works in indices and has to talk to the memory
+    // module in positions. Indices inside a chunk all report the chunk's start position.
+    std::vector<llama_pos> pos_map() const;
+
+    // [TAG_REUSE_MTMD] length of the run of equal tokens starting at this[i] and b[j]. A media
+    // chunk matches as a whole or not at all, and only against the same chunk (same id and size),
+    // so a run never starts or ends inside one.
+    size_t match_run(size_t i, const server_tokens & b, size_t j) const;
+
+    // [TAG_REUSE_MTMD] move a run of n tokens from src down to dst, carrying the media chunks
+    // inside it and dropping the entries the destination overwrites. Cache reuse keeps the run's
+    // KV cells and only renumbers them, so the token list must follow.
+    void move_range(size_t dst, size_t src, size_t n);
+
+    // [TAG_PROMPT_TRUNCATE] drop [keep_head, cut) and pull the tail down in its place, media and
+    // all. Used when a prompt does not fit the context: the head (system prompt) and the newest
+    // messages are kept, the middle goes.
+    void drop_range(size_t keep_head, size_t cut);
+
+    // [TAG_PROMPT_TRUNCATE] the first index >= idx that is not in the middle of a media chunk, so
+    // a cut there never splits an image
+    size_t next_boundary(size_t idx) const;
+
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
 
     // find next media chunk after idx
