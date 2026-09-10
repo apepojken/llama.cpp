@@ -1724,6 +1724,80 @@ private:
             slot.lora = params_base.lora_adapters;
         }
 
+        // [TAG_PROMPT_TRUNCATE] a prompt larger than the context is normally rejected, which forces
+        // every client to trim its own conversation. With --prompt-truncate the server trims instead:
+        // keep the head (the system prompt, or --keep tokens) plus the newest messages and drop whole
+        // messages in between. With --cache-reuse the kept tail is then found in the cache and shifted
+        // into place, so a trim costs a shift instead of a re-prefill. The newest user message is never
+        // dropped: if the prompt cannot be made to fit without eating it, the request is rejected as before.
+        if (params_base.prompt_truncate && !task.is_parent() && !task.is_child()) {
+            const int32_t n_ctx = n_ctx_slot();
+
+            // leave room for the answer: what this request asks for, within sane bounds
+            const int32_t n_predict = task.params.n_predict > 0 ? task.params.n_predict : n_ctx/8;
+            const int32_t n_room    = std::clamp(n_predict, 64, n_ctx/4);
+            const int32_t n_max     = n_ctx - n_room - 4;
+
+            auto &       spans     = task.params.message_spans.spans;
+            const size_t n_tokens  = task.n_tokens();
+
+            if (n_max > 0 && n_tokens > (size_t) n_max) {
+                // the head to keep: --keep tokens, else everything before the first user message
+                size_t keep_head = 0;
+
+                if (params_base.n_keep > 0) {
+                    keep_head = std::min<size_t>(params_base.n_keep, n_tokens);
+                } else {
+                    for (const auto & sp : spans) {
+                        if (sp.role == COMMON_CHAT_ROLE_USER) {
+                            keep_head = sp.pos;
+                            break;
+                        }
+                    }
+                }
+
+                keep_head = task.tokens.next_boundary(keep_head);
+
+                // drop at least this much, then round the cut up to the start of a message
+                size_t cut = keep_head + (n_tokens - (size_t) n_max);
+
+                for (const auto & sp : spans) {
+                    if (sp.pos >= cut) {
+                        cut = sp.pos;
+                        break;
+                    }
+                }
+
+                cut = task.tokens.next_boundary(std::min(cut, n_tokens));
+
+                const int32_t last_user = task.params.message_spans.last_user_message_pos();
+                const bool    eats_last = last_user >= 0 && cut > (size_t) last_user;
+
+                if (cut > keep_head && keep_head < (size_t) n_max && !eats_last) {
+                    const size_t n_drop = cut - keep_head;
+
+                    task.tokens.drop_range(keep_head, cut);
+
+                    // the spans index into the prompt, so they move with it
+                    for (auto it = spans.begin(); it != spans.end(); ) {
+                        if (it->pos >= keep_head && it->pos < cut) {
+                            it = spans.erase(it);
+                        } else {
+                            if (it->pos >= cut) {
+                                it->pos -= n_drop;
+                            }
+                            ++it;
+                        }
+                    }
+
+                    slot.truncated = true;
+
+                    SLT_WRN(slot, "prompt truncated: dropped %zu tokens, kept the first %zu and the last %zu (n_ctx = %d)\n",
+                            n_drop, keep_head, task.n_tokens() - keep_head, n_ctx);
+                }
+            }
+        }
+
         // if using alora, make sure it's only a single one requested and active
         size_t alora_invocation_start = task.tokens.size();
         if (lora_all_alora(slot.lora)) {

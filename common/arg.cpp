@@ -1747,6 +1747,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_CONTEXT_SHIFT"));
     add_opt(common_arg(
+        {"--prompt-truncate"},
+        {"--no-prompt-truncate"},
+        string_format("whether to truncate a prompt that does not fit the context instead of rejecting it: "
+                      "the first --keep tokens (or the first message) are kept, then whole messages are dropped "
+                      "until the rest fits, so a client that never trims its conversation still gets served "
+                      "(default: %s)", params.prompt_truncate ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.prompt_truncate = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_TRUNCATE"));
+    add_opt(common_arg(
         {"--chunks"}, "N",
         string_format("max number of chunks to process (default: %d, -1 = all)", params.n_chunks),
         [](common_params & params, int value) {
