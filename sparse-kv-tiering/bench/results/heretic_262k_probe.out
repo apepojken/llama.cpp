@@ -1,0 +1,9 @@
+08:57:06 == -c 262144 -ub 1024 ==
+08:58:41   loaded, MemAvailable 9 GiB
+    prefill 22602 tokens at 162 tok/s, decode 0.0 t/s
+09:01:05   ok at ub 1024
+09:01:08 == -c 262144 -ub 512 ==
+09:02:31   loaded, MemAvailable 15 GiB
+    prefill 22602 tokens at 208 tok/s, decode 0.0 t/s
+09:04:24   ok at ub 512
+09:04:27 262K-PROBE-DONE

@@ -1,0 +1,8 @@
+13:39:05 == slid: prefill A (image in the middle), then the picture question on the slid cache ==
+13:42:44   slid: shifts 1, forced re-prefill 0
+13:42:47 == control: the same question, fresh server, full prefill ==
+13:45:38   ctl: shifts 0, forced re-prefill 0
+  slid   : prompt_n 64, 2.1s -> 'PLUM 42'
+  control: prompt_n 21875, 103.6s -> 'PLUM 42'
+  picture read after the shift: True; control: True; same answer: True
+13:45:45 IMAGE-READ2-DONE

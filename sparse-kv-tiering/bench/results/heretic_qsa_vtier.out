@@ -1,0 +1,19 @@
+11:22:04 == hot tier: none (restricts prefill too: 1) ==
+  Q1: prompt_n 70570 at 188 tok/s, decode 125 tokens at 22.1 t/s, recall 3:Y 80:Y 157:Y m120:Y  (390s)
+  Q2: prompt_n 1033 at 178 tok/s, decode 125 tokens at 22.8 t/s, recall 3:Y 80:Y 157:Y m120:Y  (11s)
+11:30:12 == hot tier: 0.25 (restricts prefill too: 0) ==
+  Q1: prompt_n 70570 at 204 tok/s, decode 145 tokens at 20.2 t/s, recall 3:n 80:n 157:Y m120:n  (354s)
+  Q2: prompt_n 1033 at 150 tok/s, decode 97 tokens at 20.8 t/s, recall 3:n 80:n 157:Y m120:n  (12s)
+    qsa_vtier: filter active (first call: block 0 of 256, batch 1024, step 2)
+    qsa_vtier: step 256: hot 4418 of 17671 blocks
+11:37:31 == hot tier: 0.10 (restricts prefill too: 0) ==
+  Q1: prompt_n 70570 at 227 tok/s, decode 86 tokens at 21.2 t/s, recall 3:n 80:n 157:n m120:n  (316s)
+  Q2: prompt_n 1033 at 176 tok/s, decode 47 tokens at 21.7 t/s, recall 3:n 80:n 157:n m120:n  (8s)
+    qsa_vtier: filter active (first call: block 0 of 256, batch 1024, step 2)
+    qsa_vtier: step 256: hot 1765 of 17650 blocks
+11:44:34 == hot tier: 0.25 (restricts prefill too: 1) ==
+  Q1: prompt_n 70570 at 226 tok/s, decode 47 tokens at 21.1 t/s, recall 3:n 80:n 157:n m120:n  (316s)
+  Q2: prompt_n 1033 at 211 tok/s, decode 47 tokens at 21.3 t/s, recall 3:n 80:n 157:n m120:n  (7s)
+    qsa_vtier: filter active (first call: block 0 of 256, batch 1024, step 2)
+    qsa_vtier: step 2: hot 64 of 256 blocks
+11:50:49 VTIER-DONE

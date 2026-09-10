@@ -1,0 +1,17 @@
+13:43:39 == IQ3_M ==
+  OK  expected 'PLUM 42'                                got 'PLUM 42'
+  OK  expected 'Invoice 7731-B'                         got 'Invoice 7731-B'
+  OK  expected 'mixed Case Text'                        got 'mixed Case Text'
+  OK  expected 'error: ECONNREFUSED 127.0.0.1:8096'     got 'error: ECONNREFUSED 127.0.0.1:8096'
+  OK  expected 'Total: $1,284.50'                       got 'Total: $1,284.50'
+  OK  expected 'qwen4exp block 47'                      got 'qwen4exp block 47'
+  score 6/6
+13:45:52 == Q4_K_M ==
+  OK  expected 'PLUM 42'                                got 'plum42'
+  OK  expected 'Invoice 7731-B'                         got 'Invoice 7731-B'
+  OK  expected 'mixed Case Text'                        got 'mixed Case Text'
+  OK  expected 'error: ECONNREFUSED 127.0.0.1:8096'     got 'error:ECONNREFUSED127.0.0.1:8096'
+  OK  expected 'Total: $1,284.50'                       got 'Total: $1,284.50'
+  OK  expected 'qwen4exp block 47'                      got 'qwen4exp block 47'
+  score 6/6
+13:47:20 VISION-COMPARE-DONE

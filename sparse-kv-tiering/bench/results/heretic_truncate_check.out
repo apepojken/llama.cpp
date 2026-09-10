@@ -1,0 +1,11 @@
+08:28:30 == with --prompt-truncate ==
+08:30:20   server up (trunc)
+    conversation: 62 messages, 46370 chars templated
+08:31:06   T1: prompt_n 7798, 37.6s, system prompt honoured: True, answer 'CODE-29\n\nZEBRA-9'
+08:31:07   T2: prompt_n 40, 0.8s, system prompt honoured: False, answer 'CODE-28'
+    prompt truncated: dropped 7166 tokens, kept the first 39 and the last 7759 (n_ctx = 8192)
+    prompt truncated: dropped 7166 tokens, kept the first 39 and the last 7767 (n_ctx = 8192)
+08:31:11 == without the flag (default behaviour) ==
+08:32:39   server up (plain)
+08:32:39   T3: REJECTED: {'code': 400, 'message': 'request (14964 tokens) exceeds the available context size (8192 tokens), try increasing it', '
+08:32:46 TRUNCATE-CHECK-DONE

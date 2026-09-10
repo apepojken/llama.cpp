@@ -1,0 +1,30 @@
+17:47:24 MemAvailable: 113 GiB
+request built: 218914 chars (~54728 tok), 160 facts/copy x12, marker for fact 120 = 415
+17:47:24 == A: llama.cpp-main + MTP (QSA off) = prod ==
+17:48:26   loaded in 59s, MemAvailable 27 GiB
+  common_speculative_init_result: creating MTP draft context against the target model '/home/jocke/LLM/models/Qw
+17:51:51   request done in 205s, MemAvailable 26 GiB
+17:51:55 == B: llama.cpp-main + MTP-qsa (QSA on) ==
+17:54:07   loaded in 129s, MemAvailable 25 GiB
+  common_speculative_init_result: creating MTP draft context against the target model '/home/jocke/LLM/models/Qw
+17:57:36   request done in 209s, MemAvailable 24 GiB
+17:57:40 == C: build-heretic (-new kernels) + MTP-qsa (QSA on) ==
+17:59:24   loaded in 101s, MemAvailable 27 GiB
+  common_speculative_init_result: creating MTP draft context against the target model '/home/jocke/LLM/models/Qw
+18:03:43   request done in 259s, MemAvailable 24 GiB
+18:03:47 == D: build-heretic (-new kernels) + MTP (QSA off) ==
+18:05:03   loaded in 73s, MemAvailable 27 GiB
+  common_speculative_init_result: creating MTP draft context against the target model '/home/jocke/LLM/models/Qw
+18:09:00   request done in 237s, MemAvailable 26 GiB
+| cfg | binary / model | prefill @~55k | decode @~55k | MTP accept | recall |
+|---|---|---|---|---|---|
+| A | main / QSA off (prod) | 295.4 tok/s (192s, 56654 tok) | 19.4 t/s (243 tok) | 0.906 | 4/4 |
+| B | main / QSA on | 283.0 tok/s (200s, 56654 tok) | 25.9 t/s (222 tok) | 0.865 | 4/4 |
+| C | build-heretic / QSA on | 227.7 tok/s (249s, 56654 tok) | 20.6 t/s (214 tok) | 0.847 | 4/4 |
+| D | build-heretic / QSA off | 251.9 tok/s (225s, 56654 tok) | 19.7 t/s (227 tok) | 0.841 | 4/4 |
+
+greedy oracle: A vs B: diverge at char 479 of 1251/1120
+               B vs C: diverge at char 520 of 1120/1046
+               A vs D: diverge at char 479 of 1251/1119
+               C vs D: diverge at char 520 of 1046/1119
+18:09:07 QSA-BENCH-DONE

@@ -1,0 +1,19 @@
+13:10:07 == IQ3_M ==
+13:10:58   loaded in 51s: RAM free 39.3 GiB, GPU-held 76.0 GiB
+  14k: prefill 14228 at 317 tok/s, decode 228 at 37.0 t/s, draft accept 0.95, recall 4/4, agrees with the Q4 reference for 3 of 1144 chars (51s)
+  56k: prefill 43454 at 248 tok/s, decode 246 at 34.1 t/s, draft accept 0.94, recall 4/4 (182s)
+  picture alone: 'plum4u'
+  picture in a 32717-token prompt: prefill 248 tok/s, decode 41.8 t/s, recall 2/4, picture read: False (134s)
+13:17:13 == Q4_K_M ==
+13:18:33   loaded in 80s: RAM free 18.3 GiB, GPU-held 97.1 GiB
+  14k: prefill 14228 at 303 tok/s, decode 212 at 19.3 t/s, draft accept 0.91, recall 4/4, agrees with the Q4 reference for 941 of 1144 chars (58s)
+  56k: prefill 43454 at 220 tok/s, decode 216 at 29.3 t/s, draft accept 0.87, recall 4/4 (205s)
+  picture alone: 'PLUM42'
+  picture in a 32717-token prompt: prefill 240 tok/s, decode 38.4 t/s, recall 2/4, picture read: False (139s)
+13:25:24 == perplexity 64k, IQ3_M ==
+  [1]1.1179,
+  6.56.331.506 I Final estimate: PPL = 1.1179 +/- 0.00433
+13:32:21 == perplexity 64k, Q4_K_M ==
+  [1]1.1151,
+  8.33.733.652 I Final estimate: PPL = 1.1151 +/- 0.00429
+13:41:06 QUANT-COMPARE-DONE

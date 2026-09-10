@@ -1,0 +1,26 @@
+[
+ {
+  "file": "vision_case_0.png",
+  "text": "PLUM 42"
+ },
+ {
+  "file": "vision_case_1.png",
+  "text": "Invoice 7731-B"
+ },
+ {
+  "file": "vision_case_2.png",
+  "text": "mixed Case Text"
+ },
+ {
+  "file": "vision_case_3.png",
+  "text": "error: ECONNREFUSED 127.0.0.1:8096"
+ },
+ {
+  "file": "vision_case_4.png",
+  "text": "Total: $1,284.50"
+ },
+ {
+  "file": "vision_case_5.png",
+  "text": "qwen4exp block 47"
+ }
+]

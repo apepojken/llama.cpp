@@ -1,0 +1,9 @@
+11:52:18 == hot tier: 0.25 (restricts prefill too: 0, policy freq) ==
+  Q1: prompt_n 70570 at 212 tok/s, decode 114 tokens at 20.3 t/s, recall 3:Y 80:n 157:n m120:n  (346s)
+  Q2: prompt_n 1033 at 175 tok/s, decode 112 tokens at 21.1 t/s, recall 3:Y 80:n 157:n m120:n  (11s)
+    qsa_vtier: filter active (first call: block 0 of 256, batch 1024, step 2)
+11:59:27 == hot tier: 0.10 (restricts prefill too: 0, policy freq) ==
+  Q1: prompt_n 70570 at 204 tok/s, decode 55 tokens at 20.4 t/s, recall 3:Y 80:n 157:n m120:n  (350s)
+  Q2: prompt_n 1033 at 176 tok/s, decode 58 tokens at 21.3 t/s, recall 3:Y 80:n 157:n m120:n  (9s)
+    qsa_vtier: filter active (first call: block 0 of 256, batch 1024, step 2)
+12:06:39 VTIER-DONE
