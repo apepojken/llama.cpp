@@ -160,6 +160,11 @@ public:
 
     bool get_has_shift() const;
 
+    // [TAG_KV_DROP_SHIFT] forget the K-shift that seq_add recorded, keeping the new positions. Only
+    // for a cache whose keys are stored before RoPE (the qwen4exp indexer): rotating those would
+    // corrupt them, and their consumer re-reads the positions anyway.
+    void drop_pending_shift();
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 

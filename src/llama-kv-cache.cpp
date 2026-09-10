@@ -1232,6 +1232,13 @@ bool llama_kv_cache::get_has_shift() const {
     return result;
 }
 
+void llama_kv_cache::drop_pending_shift() {
+    // [TAG_KV_DROP_SHIFT]
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        v_cells[s].reset_shift();
+    }
+}
+
 ggml_type llama_kv_cache::type_k() const {
     return layers[0].k->type;
 }

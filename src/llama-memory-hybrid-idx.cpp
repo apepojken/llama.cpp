@@ -209,7 +209,34 @@ void llama_memory_hybrid_idx::clear(bool data) {
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
     if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
-        return false;
+        // [TAG_HYBRID_MID_RM] the recurrent cache refuses any partial removal that is not a
+        // rollback of its last n_rs_seq tokens, because its state cannot be rewound. A removal
+        // of a MIDDLE range needs no rewind: the state is a running summary through the end of
+        // the sequence and stays valid when earlier cells leave the attention caches (it keeps a
+        // faded trace of them, which is wanted). So evict the range from the attention and
+        // indexer caches only. This is what a sliding window (context shift / prompt-cache
+        // reuse by KV shifting) needs on a hybrid model. Tail removals are still refused.
+        if (seq_id < 0 || p0 <= 0 || p1 < 0) {
+            return false;
+        }
+
+        const llama_pos pos_max = get_mem_attn()->seq_pos_max(seq_id);
+
+        if (pos_max < 0 || p1 > pos_max) {
+            return false;   // reaches the end of the sequence: a rewind the state cannot follow
+        }
+
+        if (getenv("LLAMA_HYBRID_NO_MID_RM") != nullptr) {
+            return false;
+        }
+
+        if (mem_idx) {
+            mem_idx->seq_rm(seq_id, p0, p1);
+        }
+
+        pooled_rm(seq_id, p0, p1);
+
+        return get_mem_attn()->seq_rm(seq_id, p0, p1);
     }
 
     if (mem_idx) {
@@ -248,10 +275,35 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    // [TAG_HYBRID_TAIL_SHIFT] the recurrent state is a single running summary and its position is
+    // just the last position of the sequence. llama_memory_recurrent::seq_add moves it only when it
+    // lies inside [p0, p1), so a prompt-cache reuse shift leaves it behind: that shift renumbers the
+    // chunk that matched the new prompt and everything the cache holds after the chunk is dropped,
+    // which puts the state's position at the end of the chunk. Without this the sequence keeps
+    // reporting its old (much larger) pos_min and the server discards the whole shifted cache with
+    // "forcing full prompt re-processing due to lack of cache data ... hybrid/recurrent memory".
+    // A shift that reaches the end of the sequence (p1 < 0, the classic context shift) is already
+    // handled by the call below. With several chunks the last one wins, as it must.
+    const llama_pos rec_pos    = (seq_id >= 0 && shift != 0 && p1 > p0) ? get_mem_recr()->seq_pos_max(seq_id) : -1;
+    const bool      tail_after = rec_pos >= 0 && rec_pos >= p1;
+
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
+
+    if (tail_after) {
+        const llama_pos rec_new = p1 - 1 + shift;
+
+        LLAMA_LOG_DEBUG("%s: seq %d: recurrent state pos %d -> %d (chunk [%d, %d) shifted by %d)\n",
+                __func__, seq_id, rec_pos, rec_new, p0, p1, shift);
+
+        get_mem_recr()->seq_add(seq_id, rec_pos, rec_pos + 1, rec_new - rec_pos);
+    }
 
     if (mem_idx) {
         mem_idx->seq_add(seq_id, p0, p1, shift);
+
+        // [TAG_KV_DROP_SHIFT] indexer keys are cached before RoPE (see build_qsa_top_k), so the new
+        // positions are all a shift needs; rotating the stored keys would corrupt them
+        mem_idx->drop_pending_shift();
     }
 
     // [TAG_QSA_POOLED_CACHE] shifting positions remaps every block
@@ -267,6 +319,14 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
 
     // [TAG_QSA_POOLED_CACHE]
     pooled_reset(seq_id);
+}
+
+bool llama_memory_hybrid_idx::get_can_shift() const {
+    // [TAG_HYBRID_MID_RM] see the header: text-only sequences shift exactly under M-RoPE
+    if (getenv("LLAMA_HYBRID_NO_SHIFT") != nullptr) {
+        return llama_memory_hybrid::get_can_shift();
+    }
+    return true;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_breakdown() const {

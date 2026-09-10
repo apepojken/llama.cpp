@@ -68,6 +68,13 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    // [TAG_HYBRID_MID_RM] the attention cache reports "cannot shift" for M-RoPE models (several positions
+    // per token). For text every position component equals the token position, so a uniform shift
+    // (the K-shift graph already rotates the whole vector by the delta for M-RoPE) is exact; only 2D
+    // image tokens would be shifted wrongly. The sliding window needs the shift, so report it as
+    // supported; LLAMA_HYBRID_NO_SHIFT=1 restores the conservative answer.
+    bool get_can_shift() const override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
