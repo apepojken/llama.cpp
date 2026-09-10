@@ -26,6 +26,175 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <cstring>
+#include <functional>
+#include <iterator>
+#include <map>
+
+// [TAG_QSA_TRACE] Phase 0 of the cold-tier design (sparse-kv-tiering/DESIGN.md §9): measure the
+// indexer's block selection at depth. With LLAMA_QSA_TRACE=<file> set, an eval callback catches every
+// layer's `indexer_top_blk` tensor on decode-sized batches and keeps, per layer: how much of the selected
+// set repeats from one step to the next, and how often each block is ever selected. A summary is
+// rewritten to <file> every 64 steps. One small device->host copy per layer per step; never active
+// without the variable, so production is untouched.
+namespace qsa_trace {
+    struct layer_stats {
+        std::vector<int32_t>  prev;       // last step's selected block ids, sorted and unique
+        std::vector<uint32_t> count;      // selections per block id
+        std::vector<float>    repeat;     // per step: share of this step's blocks also selected the step before
+        int64_t               steps = 0;
+        int32_t               n_blocks_at_start = -1;
+    };
+
+    struct state {
+        std::string                path;
+        std::map<int, layer_stats> layers;
+        std::vector<int32_t>       buf;
+        int64_t                    n_collect = 0;
+    };
+
+    static state g;
+
+    static void flush() {
+        std::ofstream f(g.path, std::ios::trunc);
+        if (!f) {
+            return;
+        }
+        f << "# qsa block-selection trace, decode-sized batches only\n"
+             "# repeat: share of a step's selected blocks that were also selected the step before\n"
+             "# never_selected_pct: blocks that existed when tracing began and were never picked\n"
+             "# top10pct_share: share of all selections taken by the most-selected 10% of blocks\n"
+             "layer steps k_blk n_blocks_start never_selected_pct repeat_mean repeat_p10 repeat_p50 repeat_p90 top10pct_share\n";
+        for (auto & kv : g.layers) {
+            auto & L = kv.second;
+            if (L.steps == 0) {
+                continue;
+            }
+            std::vector<float> r = L.repeat;
+            std::sort(r.begin(), r.end());
+            auto pct = [&](double p) { return r.empty() ? 0.0f : r[std::min(r.size() - 1, (size_t) (p * r.size()))]; };
+            double mean = 0.0;
+            for (float x : r) {
+                mean += x;
+            }
+            mean /= std::max<size_t>(1, r.size());
+
+            const int32_t n0 = std::max(0, L.n_blocks_at_start);
+            int64_t never = 0;
+            for (int32_t b = 0; b < n0 && b < (int32_t) L.count.size(); ++b) {
+                never += L.count[b] == 0;
+            }
+
+            std::vector<uint32_t> c = L.count;
+            std::sort(c.begin(), c.end(), std::greater<uint32_t>());
+            uint64_t tot = 0, top = 0;
+            const size_t n_top = std::max<size_t>(1, c.size()/10);
+            for (size_t i = 0; i < c.size(); ++i) {
+                tot += c[i];
+                if (i < n_top) {
+                    top += c[i];
+                }
+            }
+
+            f << kv.first << ' ' << L.steps << ' ' << L.prev.size() << ' ' << n0 << ' '
+              << (n0 ? 100.0 * never / n0 : 0.0) << ' ' << mean << ' '
+              << pct(0.10) << ' ' << pct(0.50) << ' ' << pct(0.90) << ' '
+              << (tot ? (double) top / tot : 0.0) << '\n';
+        }
+    }
+
+    static bool cb(struct ggml_tensor * t, bool ask, void * /*user_data*/) {
+        const char * name = ggml_get_name(t);
+        // exactly "indexer_top_blk-<il>": the scheduler's cross-backend copies carry the same prefix
+        // with a suffix, and counting those would pair every step with its own copy
+        bool ours = std::strncmp(name, "indexer_top_blk-", 16) == 0 && name[16] != 0;
+        for (const char * q = name + 16; ours && *q; ++q) {
+            ours = *q >= '0' && *q <= '9';
+        }
+
+        if (ask) {
+            return ours;
+        }
+        if (!ours || t->type != GGML_TYPE_I32) {
+            return true;
+        }
+
+        const int64_t k = t->ne[0];
+        const int64_t c = t->ne[1] * t->ne[2] * t->ne[3];   // queries (or streams) in this batch
+        if (c > 8) {
+            return true;                                      // a prefill chunk: not what phase 0 measures
+        }
+        if (k < 256 || k > 1024) {
+            // narrower: the warm-up decode at a tiny context. wider: not a top-k selection at all
+            static int n_rej = 0;
+            if (n_rej++ < 4) {
+                LOG_WRN("qsa_trace: skipping %s ne=[%lld,%lld,%lld,%lld]\n", name,
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+            }
+            return true;
+        }
+
+        const int il = atoi(name + 16);
+
+        g.buf.resize((size_t) (k * c));
+        ggml_backend_tensor_get(t, g.buf.data(), 0, ggml_nbytes(t));
+
+        auto & L = g.layers[il];
+
+        // raw ids for offline analysis (hot-set sizes, miss rates at several recency windows,
+        // cross-layer working sets): records of [il, k, ids[k]] as int32, one per query column
+        {
+            static std::ofstream ids(g.path + ".ids", std::ios::binary | std::ios::trunc);
+            for (int64_t j = 0; j < c && ids; ++j) {
+                const int32_t hdr[2] = { il, (int32_t) k };
+                ids.write((const char *) hdr, sizeof(hdr));
+                ids.write((const char *) (g.buf.data() + j*k), (size_t) k * sizeof(int32_t));
+            }
+        }
+
+        // raw look at the first steps: catches a wrong layout or id range before it poisons the stats
+        if (L.steps < 3) {
+            const int32_t * v = g.buf.data();
+            int32_t lo = v[0], hi = v[0];
+            for (int64_t i = 0; i < k; ++i) { lo = std::min(lo, v[i]); hi = std::max(hi, v[i]); }
+            LOG_WRN("qsa_trace: layer %d step %lld: ne=[%lld,%lld,%lld,%lld] nb1=%zu contiguous=%d ids min %d max %d first %d %d %d %d\n",
+                    il, (long long) L.steps, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                    t->nb[1], (int) ggml_is_contiguous(t), lo, hi, v[0], v[1], v[2], v[3]);
+        }
+
+        for (int64_t j = 0; j < c; ++j) {
+            std::vector<int32_t> cur(g.buf.begin() + j*k, g.buf.begin() + (j + 1)*k);
+            std::sort(cur.begin(), cur.end());
+            cur.erase(std::unique(cur.begin(), cur.end()), cur.end());
+
+            const int32_t mx = cur.empty() ? -1 : cur.back();
+            if (mx >= (int32_t) L.count.size()) {
+                L.count.resize(mx + 1, 0);
+            }
+            for (int32_t b : cur) {
+                if (b >= 0) {
+                    L.count[b]++;
+                }
+            }
+            if (L.n_blocks_at_start < 0) {
+                L.n_blocks_at_start = mx + 1;
+            }
+            if (!L.prev.empty()) {
+                std::vector<int32_t> inter;
+                std::set_intersection(L.prev.begin(), L.prev.end(), cur.begin(), cur.end(), std::back_inserter(inter));
+                L.repeat.push_back(cur.empty() ? 0.0f : (float) inter.size() / (float) cur.size());
+            }
+            L.prev = std::move(cur);
+            L.steps++;
+        }
+
+        if (++g.n_collect % (64 * 12) == 0) {
+            flush();
+        }
+        return true;
+    }
+}
+
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -1094,6 +1263,14 @@ private:
         {
             params_base.load_progress_callback = load_progress_callback;
             params_base.load_progress_callback_user_data = &load_progress_text;
+        }
+
+        // [TAG_QSA_TRACE] phase-0 measurement build: LLAMA_QSA_TRACE=<file>
+        if (const char * p = getenv("LLAMA_QSA_TRACE")) {
+            qsa_trace::g.path = p;
+            params_base.cb_eval           = qsa_trace::cb;
+            params_base.cb_eval_user_data = nullptr;
+            SRV_WRN("QSA selection trace enabled -> %s (measurement build, slower decode)\n", p);
         }
 
         llama_init = common_init_from_params(params_base);
