@@ -15,6 +15,7 @@ behind every number are in `sparse-kv-tiering/` (`RESULTS.md`, `DESIGN.md`).
 | `42533a9b6` server: cache reuse with media, and with a projector loaded | `--cache-reuse` was disabled whenever a projector was loaded. Media chunks are now matched whole, positions are mapped correctly when images are present, and a moved run carries its media entries. | any model; matters for multimodal serving | nothing (server only) |
 | `2b08e2880` server: `--prompt-truncate` | A prompt larger than the window is trimmed at message boundaries (system prompt kept, newest message never dropped) instead of rejected; with `--cache-reuse` the kept tail is shifted, not re-processed. Off by default. | any model, any chat client | the reuse commit |
 | `b54dcc996` server: `LLAMA_QSA_TRACE` | Measurement only: per-step trace of the indexer's block selection, inert without the variable. | qwen4exp | the qwen4exp commit |
+| (next) measurement: `LLAMA_QSA_VTIER` | Measurement only: a virtual hot tier that hides blocks outside an LRU from the selection, to test drop-only caching. Result: a 25 % cap loses 3 of 4 planted facts with either retention policy, so no drop-only tier. Inert without the variable. | qwen4exp | the trace commit |
 
 **Flags that make the sliding window work end to end:** `--cache-reuse 256 --cache-ram 0 --prompt-truncate`
 (`--cache-ram 0` because the host prompt cache otherwise clears the slot on a zero-prefix request). Keep the

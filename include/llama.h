@@ -1631,6 +1631,12 @@ extern "C" {
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
 
+    // [TAG_QSA_VTIER] experimental measurement hook: a filter over the block-sparse attention's
+    // per-block bias. Return false to hide a complete block from the selection (a "virtual
+    // eviction"); the always-visible tail is never filtered. nullptr removes the filter.
+    typedef bool (*llama_qsa_block_filter)(int32_t block, int32_t n_blocks, int32_t n_batch_tokens, void * user_data);
+    LLAMA_API void llama_qsa_set_block_filter(llama_qsa_block_filter filter, void * user_data);
+
 #ifdef __cplusplus
 }
 #endif

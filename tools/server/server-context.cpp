@@ -51,11 +51,71 @@ namespace qsa_trace {
         std::map<int, layer_stats> layers;
         std::vector<int32_t>       buf;
         int64_t                    n_collect = 0;
+
+        // [TAG_QSA_VTIER] the virtual hot tier: LRU over blocks, capacity = frac * n_blocks, where a
+        // block's creation and every selection (prefill included) count as a use. Union across
+        // layers, since one bias serves all of them and the design evicts a block for all layers.
+        double                     vtier_frac    = 0.0;
+        bool                       vtier_prefill = true;
+        int64_t                    step       = 0;   // graphs whose selections have been folded in
+        int64_t                    hot_step   = -1;  // step the cached hot set was computed for
+        std::vector<int64_t>       last_used;        // per block: last step it was created or selected
+        std::vector<int64_t>       n_used;           // per block: how many query columns selected it
+        bool                       vtier_freq = false; // LLAMA_QSA_VTIER_POLICY=freq: rank by n_used, not recency
+        std::vector<uint8_t>       hot;
+        int64_t                    n_hot = 0, n_hidden_calls = 0;
     };
 
     static state g;
 
+    static bool vtier_filter(int32_t b, int32_t n_blocks, int32_t n_batch_tokens, void * /*ud*/) {
+        static int64_t n_calls = 0;
+        if (n_calls++ == 0) {
+            LOG_WRN("qsa_vtier: filter active (first call: block %d of %d, batch %d, step %lld)\n", b, n_blocks, n_batch_tokens, (long long) g.step);
+        }
+        // LLAMA_QSA_VTIER_PREFILL=0: the prompt is processed with everything resident and only decode
+        // runs against the tier (a disk tier that fills during prefill and evicts afterwards)
+        if (!g.vtier_prefill && n_batch_tokens > 8) {
+            return true;
+        }
+        if (g.hot_step != g.step) {
+            // new blocks count as just used; then keep the most recently used frac * n_blocks
+            if ((int32_t) g.last_used.size() < n_blocks) {
+                g.last_used.resize(n_blocks, g.step);
+            }
+            if ((int32_t) g.n_used.size() < n_blocks) {
+                g.n_used.resize(n_blocks, 0);
+            }
+            const int64_t cap = std::max<int64_t>(1, (int64_t) (g.vtier_frac * n_blocks + 0.5));
+            std::vector<int32_t> order(n_blocks);
+            for (int32_t i = 0; i < n_blocks; ++i) order[i] = i;
+            // most recently used first; ties broken towards newer blocks
+            // recency: most recently used first. frequency: most often selected first (a block many
+            // queries wanted is kept even if it is old). Ties break towards newer blocks either way.
+            std::partial_sort(order.begin(), order.begin() + std::min<int64_t>(cap, n_blocks), order.end(),
+                    [&](int32_t x, int32_t y) {
+                        if (g.vtier_freq) {
+                            return g.n_used[x] != g.n_used[y] ? g.n_used[x] > g.n_used[y] : x > y;
+                        }
+                        return g.last_used[x] != g.last_used[y] ? g.last_used[x] > g.last_used[y] : x > y;
+                    });
+            g.hot.assign(n_blocks, 0);
+            for (int64_t i = 0; i < std::min<int64_t>(cap, n_blocks); ++i) g.hot[order[i]] = 1;
+            g.n_hot = std::min<int64_t>(cap, n_blocks);
+            g.hot_step = g.step;
+            if (g.step < 4 || g.step % 256 == 0) {
+                LOG_WRN("qsa_vtier: step %lld: hot %lld of %d blocks\n", (long long) g.step, (long long) g.n_hot, n_blocks);
+            }
+        }
+        if (b >= (int32_t) g.hot.size()) return true;
+        if (!g.hot[b]) g.n_hidden_calls++;
+        return g.hot[b] != 0;
+    }
+
     static void flush() {
+        if (g.path.empty()) {
+            return;
+        }
         std::ofstream f(g.path, std::ios::trunc);
         if (!f) {
             return;
@@ -119,8 +179,22 @@ namespace qsa_trace {
             return true;
         }
 
-        const int64_t k = t->ne[0];
-        const int64_t c = t->ne[1] * t->ne[2] * t->ne[3];   // queries (or streams) in this batch
+        const int64_t k  = t->ne[0];
+        const int64_t c  = t->ne[1] * t->ne[2] * t->ne[3];  // queries (or streams) in this batch
+        const int     il = atoi(name + 16);
+
+        // [TAG_QSA_VTIER] every selection is a use, prefill chunks included
+        if (g.vtier_frac > 0.0 && k >= 1 && k <= 1024) {
+            g.buf.resize((size_t) (k * c));
+            ggml_backend_tensor_get(t, g.buf.data(), 0, ggml_nbytes(t));
+            int32_t mx = -1;
+            for (const int32_t b : g.buf) mx = std::max(mx, b);
+            if (mx >= (int32_t) g.last_used.size()) g.last_used.resize(mx + 1, g.step);
+            if (mx >= (int32_t) g.n_used.size())    g.n_used.resize(mx + 1, 0);
+            for (const int32_t b : g.buf) if (b >= 0) { g.last_used[b] = g.step; g.n_used[b]++; }
+            if (il == 3) g.step++;                             // the first QSA layer closes a graph's bookkeeping
+        }
+
         if (c > 8) {
             return true;                                      // a prefill chunk: not what phase 0 measures
         }
@@ -134,8 +208,6 @@ namespace qsa_trace {
             return true;
         }
 
-        const int il = atoi(name + 16);
-
         g.buf.resize((size_t) (k * c));
         ggml_backend_tensor_get(t, g.buf.data(), 0, ggml_nbytes(t));
 
@@ -144,7 +216,7 @@ namespace qsa_trace {
         // raw ids for offline analysis (hot-set sizes, miss rates at several recency windows,
         // cross-layer working sets): records of [il, k, ids[k]] as int32, one per query column
         {
-            static std::ofstream ids(g.path + ".ids", std::ios::binary | std::ios::trunc);
+            static std::ofstream ids(g.path.empty() ? "/dev/null" : g.path + ".ids", std::ios::binary | std::ios::trunc);
             for (int64_t j = 0; j < c && ids; ++j) {
                 const int32_t hdr[2] = { il, (int32_t) k };
                 ids.write((const char *) hdr, sizeof(hdr));
@@ -1271,6 +1343,18 @@ private:
             params_base.cb_eval           = qsa_trace::cb;
             params_base.cb_eval_user_data = nullptr;
             SRV_WRN("QSA selection trace enabled -> %s (measurement build, slower decode)\n", p);
+        }
+        // [TAG_QSA_VTIER] LLAMA_QSA_VTIER=<fraction>: hide every complete block outside an LRU hot
+        // tier of that size from the selection. Needs the trace callback to see the selections.
+        if (const char * v = getenv("LLAMA_QSA_VTIER")) {
+            qsa_trace::g.vtier_frac       = atof(v);
+            qsa_trace::g.vtier_prefill    = getenv("LLAMA_QSA_VTIER_PREFILL") ? atoi(getenv("LLAMA_QSA_VTIER_PREFILL")) != 0 : true;
+            qsa_trace::g.vtier_freq       = getenv("LLAMA_QSA_VTIER_POLICY") && std::string(getenv("LLAMA_QSA_VTIER_POLICY")) == "freq";
+            params_base.cb_eval           = qsa_trace::cb;
+            params_base.cb_eval_user_data = nullptr;
+            llama_qsa_set_block_filter(qsa_trace::vtier_filter, nullptr);
+            SRV_WRN("QSA virtual hot tier: %.0f%% of blocks, %s, policy %s (measurement build)\n", 100.0 * qsa_trace::g.vtier_frac,
+                    qsa_trace::g.vtier_prefill ? "applied during prefill too" : "decode only", qsa_trace::g.vtier_freq ? "frequency" : "recency");
         }
 
         llama_init = common_init_from_params(params_base);

@@ -452,6 +452,15 @@ void llama_memory_hybrid_idx::pooled_reset(llama_seq_id seq_id) {
     }
 }
 
+// [TAG_QSA_VTIER]
+static llama_qsa_block_filter g_qsa_block_filter    = nullptr;
+static void *                 g_qsa_block_filter_ud = nullptr;
+
+void llama_qsa_set_block_filter(llama_qsa_block_filter filter, void * user_data) {
+    g_qsa_block_filter    = filter;
+    g_qsa_block_filter_ud = user_data;
+}
+
 void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
@@ -861,6 +870,11 @@ void llama_memory_hybrid_idx::set_input_qsa(
                         cur_blk_bias[b] = -INFINITY;
                     } else {
                         cur_blk_bias[b] = bid_idx[b] >= tail_start ? 1e9f : 0.0f;
+                    }
+
+                    // [TAG_QSA_VTIER] a block the virtual tier does not hold cannot be selected
+                    if (g_qsa_block_filter && cur_blk_bias[b] == 0.0f && !g_qsa_block_filter((int32_t) b, n_bid, (int32_t) n_tokens, g_qsa_block_filter_ud)) {
+                        cur_blk_bias[b] = -INFINITY;
                     }
                 }
 
